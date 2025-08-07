@@ -18,10 +18,10 @@ app = Flask(__name__)
 CORS(app)
 
 # Odoo connection configuration
-ODOO_URL = "https://prezlab-staging-22061821.dev.odoo.com"
-ODOO_DB = "prezlab-staging-22061821"
-ODOO_USERNAME = "omar.elhasan@prezlab.com"
-ODOO_PASSWORD = "Omar@@1998"
+ODOO_URL = os.environ.get('ODOO_URL', 'https://prezlab-staging-22061821.dev.odoo.com')
+ODOO_DB = os.environ.get('ODOO_DB', 'prezlab-staging-22061821')
+ODOO_USERNAME = os.environ.get('ODOO_USERNAME', 'omar.elhasan@prezlab.com')
+ODOO_PASSWORD = os.environ.get('ODOO_PASSWORD', 'YOUR_NEW_PASSWORD_HERE')
 
 # Performance configuration
 ENABLE_PARALLEL_PROCESSING = True  # Re-enabled parallel processing
