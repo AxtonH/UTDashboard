@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  dashboard:
+    build: .
+    ports:
+      - "5000:5000"
+    environment:
+      - FLASK_ENV=production
+    restart: unless-stopped
+    volumes:
+      # Mount a volume for persistent cache if needed
+      - dashboard_cache:/app/cache
+    networks:
+      - dashboard_network
+
+networks:
+  dashboard_network:
+    driver: bridge
+
+volumes:
+  dashboard_cache:

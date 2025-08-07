@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: dashboard
+    env: python
+    buildCommand: |
+      npm install
+      npm run build
+      pip install -r requirements.txt
+    startCommand: python production_app.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: NODE_VERSION  
+        value: 18
+    autoDeploy: false

@@ -1,0 +1,14 @@
+[phases.build]
+cmds = [
+  "npm install",
+  "CI=false npm run build",
+  "pip install -r requirements.txt"
+]
+
+[phases.start]
+cmd = "python production_app.py"
+
+[variables]
+NODE_VERSION = "18"
+PYTHON_VERSION = "3.11"
+CI = "false"

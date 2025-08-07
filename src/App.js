@@ -14,8 +14,6 @@ function App() {
   const [timesheetData, setTimesheetData] = useState([]);
   const [availableResources, setAvailableResources] = useState([]);
   const [showDetailedView, setShowDetailedView] = useState(false);
-  const [selectedTeamData, setSelectedTeamData] = useState(null);
-  const [selectedTeamName, setSelectedTeamName] = useState('');
   const [allDepartmentsData, setAllDepartmentsData] = useState({});
   const [cacheStatus, setCacheStatus] = useState({});
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -26,9 +24,7 @@ function App() {
   const [detailedTeamData, setDetailedTeamData] = useState(null);
   const [fetchProgress, setFetchProgress] = useState(0);
   const [dataReady, setDataReady] = useState(false); // New state to track when all data is ready
-  const [retryCount, setRetryCount] = useState(0); // Track retry attempts
   const [currentCacheKey, setCurrentCacheKey] = useState(''); // Track current cache key (period_viewType)
-  const [isRetrying, setIsRetrying] = useState(false); // Track if currently retrying
 
 
 
@@ -112,19 +108,7 @@ function App() {
     }
   };
 
-  // Helper function to get day date
-  const getDayDate = (year, day) => {
-    const startOfYear = new Date(year, 0, 1);
-    const targetDate = new Date(startOfYear);
-    targetDate.setDate(startOfYear.getDate() + day - 1);
-    
-    return targetDate.toLocaleDateString('en-US', { 
-      weekday: 'long', 
-      year: 'numeric', 
-      month: 'long', 
-      day: 'numeric' 
-    });
-  };
+
 
   useEffect(() => {
     console.log(`useEffect triggered - selectedPeriod: ${selectedPeriod}, viewType: ${viewType}, selectedDepartment: ${selectedDepartment}`);
