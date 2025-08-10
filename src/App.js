@@ -114,7 +114,17 @@ function App() {
     console.log(`useEffect triggered - selectedPeriod: ${selectedPeriod}, viewType: ${viewType}, selectedDepartment: ${selectedDepartment}`);
     
     const fetchData = async () => {
-      setLoading(true);
+      const hasAnyData = (
+        employees.length > 0 ||
+        availableResources.length > 0 ||
+        timesheetData.length > 0 ||
+        Object.keys(teamUtilizationData).length > 0
+      );
+      if (!hasAnyData) {
+        setLoading(true);
+      } else {
+        setIsRefreshing(true);
+      }
       setError(null);
       setFetchProgress(0);
       
@@ -128,7 +138,8 @@ function App() {
         }, 200);
         
         // Use the new caching API to fetch all departments data
-        const apiUrl = `/api/all-departments-data?period=${selectedPeriod}&view_type=${viewType}`;
+        // Request full payload on initial load to ensure dashboard completeness
+        const apiUrl = `/api/all-departments-data?period=${selectedPeriod}&view_type=${viewType}&selected_department=${encodeURIComponent(selectedDepartment)}&include=employees,team_utilization,available_resources,timesheet_data`;
         console.log(`Making API request to: ${apiUrl}`);
         console.log(`Request parameters - period: ${selectedPeriod}, view_type: ${viewType}`);
         
@@ -190,8 +201,9 @@ function App() {
         if (currentDepartmentData) {
           const newEmployees = currentDepartmentData.employees || [];
           const newTeamUtilization = currentDepartmentData.team_utilization || {};
-          const newTimesheetData = currentDepartmentData.timesheet_data || [];
-          const newAvailableResources = currentDepartmentData.available_resources || [];
+          // In lean include, these may be missing; keep old values until explicitly requested
+          const newTimesheetData = currentDepartmentData.timesheet_data !== undefined ? currentDepartmentData.timesheet_data : timesheetData;
+          const newAvailableResources = currentDepartmentData.available_resources !== undefined ? currentDepartmentData.available_resources : availableResources;
           
           console.log(`Setting new data:`);
           console.log(`- Employees: ${newEmployees.length}`);
@@ -214,7 +226,7 @@ function App() {
         }
         
         // Update cache status
-        setCacheStatus({
+         setCacheStatus({
           cached,
           last_updated: cache_timestamp
         });
@@ -227,10 +239,12 @@ function App() {
         }
         
         setLoading(false);
+        setIsRefreshing(false);
       } catch (err) {
         console.error('Error fetching data:', err);
         setError(err.message);
         setLoading(false);
+        setIsRefreshing(false);
       }
     };
 
@@ -259,7 +273,8 @@ function App() {
       }
       
       // Fetch fresh data after cache refresh
-      const dataApiUrl = `/api/all-departments-data?period=${selectedPeriod}&view_type=${viewType}`;
+      // Request full payload after refresh
+      const dataApiUrl = `/api/all-departments-data?period=${selectedPeriod}&view_type=${viewType}&selected_department=${encodeURIComponent(selectedDepartment)}&include=employees,team_utilization,available_resources,timesheet_data`;
       console.log(`Fetching fresh data from: ${dataApiUrl}`);
       
       const dataResponse = await axios.get(dataApiUrl);
@@ -325,13 +340,20 @@ function App() {
     } else {
       console.log(`No valid cached data available (cache key mismatch or no data), will fetch fresh data`);
       console.log(`Current cache key: ${currentCacheKey}, Expected: ${expectedCacheKey}`);
-      // Clear current data to force a fresh fetch
-      setEmployees([]);
-      setTeamUtilizationData({});
-      setTimesheetData([]);
-      setAvailableResources([]);
-      setLoading(true);
+      // Keep current data visible while fetching; use soft refresh indicator
+      setIsRefreshing(true);
     }
+
+    // Ensure we fetch full payload when switching department so view is complete
+    const fullUrl = `/api/all-departments-data?period=${selectedPeriod}&view_type=${viewType}&selected_department=${encodeURIComponent(department)}&include=employees,team_utilization,available_resources,timesheet_data`;
+    axios.get(fullUrl).then(res => {
+      const data = res.data[department === 'Creative Strategy' ? 'creative_strategy' : department === 'Instructional Design' ? 'instructional_design' : 'creative'] || {};
+      setEmployees(data.employees || []);
+      setTeamUtilizationData(data.team_utilization || {});
+      setAvailableResources(data.available_resources || []);
+      setTimesheetData(data.timesheet_data || []);
+      setIsRefreshing(false);
+    }).catch(() => {}).finally(() => {});
     
     // Reset filters when switching departments
     setSelectedPoolFilters([]);
@@ -352,16 +374,10 @@ function App() {
       setSelectedPeriod(newPeriod);
     }
     
-    // Force a fresh data fetch by clearing cached data
+    // Force a fresh data fetch but keep current data visible
     setAllDepartmentsData({});
-    setEmployees([]);
-    setTeamUtilizationData({});
-    setTimesheetData([]);
-    setAvailableResources([]);
     setCurrentCacheKey(''); // Clear cache key to force fresh data fetch
-    
-    // Show loading state while fetching new data
-    setLoading(true);
+    setIsRefreshing(true);
     setDataReady(false);
     
     // Note: Removed auto-refresh to prevent conflicts with useEffect
@@ -378,16 +394,10 @@ function App() {
     console.log(`Setting period to: ${newPeriod} (first option of ${newViewType})`);
     console.log('Available options:', newPeriodOptions.slice(0, 5).map(opt => `${opt.value}: ${opt.label}`));
     
-    // Force a fresh data fetch by clearing cached data
+    // Force a fresh data fetch but keep current data visible
     setAllDepartmentsData({});
-    setEmployees([]);
-    setTeamUtilizationData({});
-    setTimesheetData([]);
-    setAvailableResources([]);
     setCurrentCacheKey(''); // Clear cache key to force fresh data fetch
-    
-    // Show loading state while fetching new data
-    setLoading(true);
+    setIsRefreshing(true);
     setDataReady(false);
     
     // Update both state values at the same time to trigger useEffect
@@ -567,13 +577,13 @@ function App() {
           >
             👥 Number of {selectedDepartment === 'Creative Strategy' || selectedDepartment === 'Instructional Design' ? 'Team Members' : 'Creatives'} ({employees.length})
           </button>
-          <button 
+            <button 
             className={`tab-btn ${activeTab === 'resources' ? 'active' : ''}`}
             onClick={() => setActiveTab('resources')}
           >
             📊 Available {selectedDepartment === 'Creative Strategy' || selectedDepartment === 'Instructional Design' ? 'Team Members' : 'Creatives'} ({availableResources.length})
           </button>
-          <button 
+            <button 
             className={`tab-btn ${activeTab === 'timesheet' ? 'active' : ''}`}
             onClick={() => setActiveTab('timesheet')}
           >

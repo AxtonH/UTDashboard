@@ -10,22 +10,33 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import psutil
+import atexit
 
 # Load environment variables
 load_dotenv()
 
+# Enable holiday subtraction by default unless explicitly overridden
+os.environ.setdefault('DISABLE_HOLIDAYS_FOR_DEBUG', 'false')
+
 app = Flask(__name__)
 CORS(app)
+try:
+    # Optional response compression to reduce payload sizes
+    from flask_compress import Compress
+    Compress(app)
+except Exception:
+    # Compression is optional; skip if dependency not installed
+    pass
 
 # Odoo connection configuration
 ODOO_URL = os.environ.get('ODOO_URL', 'https://prezlab-staging-22061821.dev.odoo.com')
 ODOO_DB = os.environ.get('ODOO_DB', 'prezlab-staging-22061821')
 ODOO_USERNAME = os.environ.get('ODOO_USERNAME', 'omar.elhasan@prezlab.com')
-ODOO_PASSWORD = os.environ.get('ODOO_PASSWORD', 'YOUR_NEW_PASSWORD_HERE')
+ODOO_PASSWORD = os.environ.get('ODOO_PASSWORD', 'Omar@@1998')
 
 # Performance configuration
 ENABLE_PARALLEL_PROCESSING = True  # Re-enabled parallel processing
-MAX_WORKERS = 2  # Number of parallel workers
+MAX_WORKERS = 3  # Number of parallel workers (match number of departments to avoid queuing)
 REQUEST_TIMEOUT = 45  # Timeout in seconds for parallel requests
 
 # Connection pool for Odoo
@@ -45,6 +56,94 @@ department_cache = {
 }
 
 cache_lock = threading.Lock()
+
+# Simple LRU/TTL cache for employee category names to avoid repeated reads
+CATEGORY_CACHE_TTL_SECONDS = int(os.environ.get('CATEGORY_CACHE_TTL_SECONDS', '3600'))
+_category_cache_lock = threading.Lock()
+_category_cache = {}  # id -> { 'name': str, 'ts': float }
+
+def get_category_names_cached(models, uid, category_ids):
+    """Return mapping of category_id -> name using a process cache with TTL; fetch missing in one batch."""
+    if not category_ids:
+        return {}
+    now_ts = time.time()
+    missing_ids = []
+    result = {}
+    with _category_cache_lock:
+        for cid in category_ids:
+            cached = _category_cache.get(cid)
+            if cached and (now_ts - cached['ts'] <= CATEGORY_CACHE_TTL_SECONDS) and cached.get('name'):
+                result[cid] = cached['name']
+            else:
+                missing_ids.append(cid)
+    if missing_ids:
+        try:
+            categories = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD,
+                'hr.employee.category', 'read',
+                [list(set(missing_ids))], {'fields': ['name']}
+            )
+            with _category_cache_lock:
+                for cat in categories:
+                    name = cat.get('name')
+                    cid = cat.get('id')
+                    if cid is None:
+                        continue
+                    _category_cache[cid] = {'name': name, 'ts': now_ts}
+                    result[cid] = name
+        except Exception as e:
+            # If fetch fails, return what we have
+            print(f"Category cache fetch failed: {e}")
+    return result
+
+# Background cache warmer to precompute hot datasets periodically
+CACHE_WARM_INTERVAL_SECONDS = int(os.environ.get('CACHE_WARM_INTERVAL_SECONDS', '600'))
+def _warm_cache_once():
+    try:
+        models, uid = connect_to_odoo()
+        if not models or not uid:
+            return
+        # Warm current month and current week for all departments
+        today = datetime.date.today()
+        period_month = today.strftime('%Y-%m')
+        # ISO week; ensure two digits
+        iso_week = today.isocalendar()[1]
+        period_week = f"{today.year}-{iso_week:02d}"
+        for view_type, period in (('monthly', period_month), ('weekly', period_week)):
+            for dept in ('Creative', 'Creative Strategy', 'Instructional Design'):
+                try:
+                    data = fetch_department_data_parallel(dept, period, view_type)
+                    if data:
+                        key = 'creative' if dept == 'Creative' else 'creative_strategy' if dept == 'Creative Strategy' else 'instructional_design'
+                        set_cached_data(key, data, period, view_type)
+                except Exception as _e:
+                    continue
+    except Exception:
+        pass
+
+_cache_warm_thread = None
+_cache_warm_stop = threading.Event()
+
+def _cache_warmer_loop():
+    while not _cache_warm_stop.is_set():
+        _warm_cache_once()
+        _cache_warm_stop.wait(CACHE_WARM_INTERVAL_SECONDS)
+
+def start_cache_warmer():
+    global _cache_warm_thread
+    if _cache_warm_thread is None or not _cache_warm_thread.is_alive():
+        _cache_warm_thread = threading.Thread(target=_cache_warmer_loop, daemon=True)
+        _cache_warm_thread.start()
+
+def stop_cache_warmer():
+    _cache_warm_stop.set()
+
+# Start warmer on import and ensure it stops on exit
+start_cache_warmer()
+atexit.register(stop_cache_warmer)
+
+# Cache: resource.calendar.id -> set of working weekdays (Mon=0..Sun=6)
+calendar_weekdays_cache = {}
 
 def get_cached_data(department, period=None, view_type='monthly'):
     """
@@ -146,21 +245,12 @@ def fetch_department_data_parallel(department_name, period=None, view_type='mont
             print(f"Error fetching employee data for {department_name}: {e}")
             return None
         
-        # Batch fetch categories
+        # Batch fetch categories using LRU/TTL cache
         all_category_ids = set()
         for emp in employees_data:
             if emp.get('category_ids'):
                 all_category_ids.update(emp['category_ids'])
-        
-        categories_dict = {}
-        if all_category_ids:
-            try:
-                categories = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'hr.employee.category', 'read', 
-                                             [list(all_category_ids)], {'fields': ['name']})
-                categories_dict = {cat['id']: cat['name'] for cat in categories if cat.get('name')}
-            except Exception as e:
-                print(f"Error fetching categories for {department_name}: {e}")
-                # Continue without categories if they fail
+        categories_dict = get_category_names_cached(models, uid, list(all_category_ids))
         
         # Prepare date strings
         start_str = start_date.strftime('%Y-%m-%d')
@@ -960,6 +1050,355 @@ def get_date_range(view_type='monthly', period=None):
         # Default to monthly view
         return get_date_range('monthly', period)
 
+def calculate_working_days_and_hours(start_date, end_date):
+    """
+    Calculate the number of working days and base available hours for a given period.
+    Working days are Sunday through Thursday (excluding Friday and Saturday).
+    
+    Args:
+        start_date (datetime.date): Start date of the period
+        end_date (datetime.date): End date of the period
+    
+    Returns:
+        tuple: (working_days, base_available_hours)
+    """
+    working_days = 0
+    current_date = start_date
+    
+    while current_date <= end_date:
+        # In Python: Monday=0, Tuesday=1, Wednesday=2, Thursday=3, Friday=4, Saturday=5, Sunday=6
+        # Working days: Sunday(6), Monday(0), Tuesday(1), Wednesday(2), Thursday(3)
+        if current_date.weekday() in [6, 0, 1, 2, 3]:  # Sunday to Thursday
+            working_days += 1
+        current_date += datetime.timedelta(days=1)
+    
+    # 8 hours per working day
+    base_available_hours = working_days * 8
+    
+    print(f"Period {start_date} to {end_date}: {working_days} working days = {base_available_hours} base hours")
+    return working_days, base_available_hours
+
+def get_employee_working_weekdays(models, uid, employee_id):
+    """
+    Return a set of Python weekday integers (Mon=0..Sun=6) that the employee
+    is scheduled to work based on hr.employee.resource_calendar_id.
+    Falls back to Sunday-Thursday if calendar or attendances are missing.
+    """
+    try:
+        emp = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'hr.employee', 'read',
+                                [[employee_id]], {'fields': ['resource_calendar_id']})
+        if not emp:
+            return {6, 0, 1, 2, 3}  # Sun-Thu fallback
+        emp = emp[0]
+        cal_field = emp.get('resource_calendar_id')
+        if not cal_field:
+            return {6, 0, 1, 2, 3}
+        cal_id = cal_field[0] if isinstance(cal_field, (list, tuple)) else cal_field
+        # Use cache for calendar weekdays to avoid repeated reads
+        if cal_id in calendar_weekdays_cache:
+            return calendar_weekdays_cache[cal_id]
+        calendars = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'resource.calendar', 'read',
+                                      [[cal_id]], {'fields': ['attendance_ids', 'name']})
+        if not calendars:
+            return {6, 0, 1, 2, 3}
+        calendar = calendars[0]
+        attendance_ids = calendar.get('attendance_ids') or []
+        if not attendance_ids:
+            return {6, 0, 1, 2, 3}
+        attendances = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'resource.calendar.attendance', 'read',
+                                        [attendance_ids], {'fields': ['dayofweek']})
+        weekdays = set()
+        for att in attendances:
+            # Odoo stores dayofweek as string '0'..'6' with Mon=0
+            d = att.get('dayofweek')
+            try:
+                d_int = int(d)
+            except Exception:
+                continue
+            if 0 <= d_int <= 6:
+                weekdays.add(d_int)
+        if not weekdays:
+            weekdays = {6, 0, 1, 2, 3}
+        # Cache and return
+        calendar_weekdays_cache[cal_id] = weekdays
+        return weekdays
+    except Exception as e:
+        print(f"Error fetching working weekdays for employee {employee_id}: {e}")
+        return {6, 0, 1, 2, 3}
+
+def calculate_employee_working_days_and_hours(models, uid, employee_id, start_date, end_date):
+    """
+    Calculate working days and base hours for one employee using their resource calendar.
+    """
+    weekdays = get_employee_working_weekdays(models, uid, employee_id)
+    working_days = 0
+    current_date = start_date
+    while current_date <= end_date:
+        if current_date.weekday() in weekdays:
+            working_days += 1
+        current_date += datetime.timedelta(days=1)
+    base_hours = working_days * 8
+    return working_days, base_hours
+
+def get_public_holidays(models, uid, start_date, end_date, company_id=None):
+    """
+    Fetch public holidays from Odoo resource.calendar.leaves within the date range.
+    Only fetches company-wide public holidays, not individual employee time-offs.
+    
+    Args:
+        models: Odoo models proxy
+        uid: User ID
+        start_date (datetime.date): Start date of the period
+        end_date (datetime.date): End date of the period
+        company_id (int, optional): Company ID to filter holidays
+    
+    Returns:
+        list: List of public holiday dictionaries with name, date_from, date_to
+        Note: Individual employee time-offs are excluded (employee_id=False filter)
+    """
+    try:
+        print(f"Fetching public holidays from {start_date} to {end_date}")
+        
+        # Optional: allow disabling holidays via env for debugging
+        # Default to enabled (set DISABLE_HOLIDAYS_FOR_DEBUG=true to turn off)
+        disable_holidays = os.environ.get('DISABLE_HOLIDAYS_FOR_DEBUG', 'false').lower() in ('1', 'true', 'yes')
+        if disable_holidays:
+            # Log this warning only once per process
+            if not getattr(get_public_holidays, '_warned_once', False):
+                print("WARNING: Holiday calculation temporarily disabled via DISABLE_HOLIDAYS_FOR_DEBUG")
+                get_public_holidays._warned_once = True
+            return []
+        
+        # Debug: First check what holiday records exist in the system
+        all_holidays_count = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            'resource.calendar.leaves', 'search_count', [[]]
+        )
+        print(f"Total holiday records in system: {all_holidays_count}")
+
+        # Check for different types of leaves to understand the data structure
+        wide_start = f"{start_date.year - 1}-01-01 00:00:00"
+        wide_end = f"{start_date.year + 1}-12-31 23:59:59"
+        
+        # Count public holidays (resource_id = False)
+        public_holidays_count = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            'resource.calendar.leaves', 'search_count',
+            [[('date_from', '<=', wide_end), ('date_to', '>=', wide_start), ('resource_id', '=', False)]]
+        )
+        print(f"Public holidays (resource_id=False) in {start_date.year - 1}-{start_date.year + 1}: {public_holidays_count}")
+        
+        # Count individual time-offs (resource_id != False)
+        individual_leaves_count = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            'resource.calendar.leaves', 'search_count',
+            [[('date_from', '<=', wide_end), ('date_to', '>=', wide_start), ('resource_id', '!=', False)]]
+        )
+        print(f"Individual time-offs (resource_id!=False) in {start_date.year - 1}-{start_date.year + 1}: {individual_leaves_count}")
+        
+        # Sample some public holidays
+        sample_public_holidays = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            'resource.calendar.leaves', 'search_read',
+            [[('date_from', '<=', wide_end), ('date_to', '>=', wide_start), ('resource_id', '=', False)]],
+            {'fields': ['name', 'date_from', 'date_to', 'company_id'], 'limit': 10}
+        )
+        print(f"Sample public holidays (resource_id=False):")
+        for h in sample_public_holidays:
+            print(f"  - {h.get('name')}: {h.get('date_from')} to {h.get('date_to')} (company: {h.get('company_id')})")
+            
+        # Sample some individual time-offs for comparison
+        sample_individual_leaves = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            'resource.calendar.leaves', 'search_read',
+            [[('date_from', '<=', wide_end), ('date_to', '>=', wide_start), ('resource_id', '!=', False)]],
+            {'fields': ['name', 'date_from', 'date_to', 'company_id', 'resource_id'], 'limit': 3}
+        )
+        print(f"Sample individual time-offs (resource_id!=False) for comparison:")
+        for h in sample_individual_leaves:
+            print(f"  - {h.get('name')}: {h.get('date_from')} to {h.get('date_to')} (company: {h.get('company_id')}, resource: {h.get('resource_id')})")
+
+        # Convert dates to datetime strings for Odoo query
+        start_datetime = f"{start_date} 00:00:00"
+        end_datetime = f"{end_date} 23:59:59"
+        
+        # Search for PUBLIC holidays that overlap with our date range
+        # Key distinction: Public holidays have resource_id = False (not tied to specific employees)
+        # Individual employee time-offs have resource_id pointing to specific employees
+        domain = [
+            ('date_from', '<=', end_datetime),
+            ('date_to', '>=', start_datetime),
+            ('resource_id', '=', False)  # Critical: Only company-wide holidays, not individual employee time-offs
+        ]
+        if company_id:
+            # Limit to company-specific holidays if specified
+            domain.append(('company_id', '=', company_id))
+
+        print(f"Public holiday search domain (resource_id=False for company-wide holidays): {domain}")
+
+        holiday_ids = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            'resource.calendar.leaves', 'search',
+            [domain]
+        )
+        
+        if not holiday_ids:
+            print("No public holidays found in the specified date range")
+            return []
+        
+        # Fetch holiday details
+        holidays = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            'resource.calendar.leaves', 'read',
+            [holiday_ids],
+            {'fields': ['name', 'date_from', 'date_to', 'company_id']}
+        )
+        
+        print(f"Found {len(holidays)} public holidays:")
+        for holiday in holidays:
+            print(f"  - {holiday['name']}: {holiday['date_from']} to {holiday['date_to']}")
+        
+        return holidays
+        
+    except Exception as e:
+        print(f"Error fetching public holidays: {e}")
+        return []
+
+def calculate_holiday_hours_in_period(holidays, start_date, end_date, view_type='monthly', working_weekdays: set = None):
+    """
+    Calculate total holiday hours that fall within the specified period.
+    
+    Args:
+        holidays (list): List of holiday dictionaries from Odoo
+        start_date (datetime.date): Start date of the period
+        end_date (datetime.date): End date of the period
+        view_type (str): 'monthly', 'weekly', or 'daily'
+    
+    Returns:
+        float: Total holiday hours in the period (per employee)
+    """
+    total_holiday_hours = 0
+    
+    # Standard working hours per day (8 hours)
+    WORKING_HOURS_PER_DAY = 8
+    
+    print(f"Calculating holiday hours for {view_type} view from {start_date} to {end_date}")
+    
+    # Safety check - if no holidays, return 0
+    if not holidays:
+        print("No holidays found for this period")
+        return 0
+    
+    for holiday in holidays:
+        try:
+            # Parse holiday dates (they come as datetime strings from Odoo)
+            if isinstance(holiday['date_from'], str):
+                # Handle different datetime formats
+                date_str = holiday['date_from'].replace('Z', '+00:00').replace(' ', 'T')
+                if 'T' not in date_str:
+                    date_str += 'T00:00:00'
+                holiday_start = datetime.datetime.fromisoformat(date_str).date()
+            else:
+                holiday_start = holiday['date_from'].date() if hasattr(holiday['date_from'], 'date') else holiday['date_from']
+                
+            if isinstance(holiday['date_to'], str):
+                # Handle different datetime formats
+                date_str = holiday['date_to'].replace('Z', '+00:00').replace(' ', 'T')
+                if 'T' not in date_str:
+                    date_str += 'T23:59:59'
+                holiday_end = datetime.datetime.fromisoformat(date_str).date()
+            else:
+                holiday_end = holiday['date_to'].date() if hasattr(holiday['date_to'], 'date') else holiday['date_to']
+            
+            # Work with datetimes for precise partial-day handling
+            holiday_start_dt = None
+            holiday_end_dt = None
+            # Parse full datetime strings from original fields for precision
+            # Safe parsing: support 'Z' and space
+            def _parse_dt(value, is_end=False):
+                if isinstance(value, str):
+                    s = value.replace('Z', '+00:00').replace(' ', 'T')
+                    if 'T' not in s:
+                        s += 'T23:59:59' if is_end else 'T00:00:00'
+                    return datetime.datetime.fromisoformat(s)
+                return value if isinstance(value, datetime.datetime) else (
+                    datetime.datetime.combine(value, datetime.time(23, 59, 59)) if is_end else datetime.datetime.combine(value, datetime.time(0, 0, 0))
+                )
+
+            holiday_start_dt = _parse_dt(holiday['date_from'], is_end=False)
+            holiday_end_dt = _parse_dt(holiday['date_to'], is_end=True)
+
+            # Period boundaries as datetimes
+            period_start_dt = datetime.datetime.combine(start_date, datetime.time(0, 0, 0))
+            period_end_dt = datetime.datetime.combine(end_date, datetime.time(23, 59, 59))
+
+            # Overlap between holiday and period
+            overlap_start_dt = max(holiday_start_dt, period_start_dt)
+            overlap_end_dt = min(holiday_end_dt, period_end_dt)
+            
+            # If there's an overlap, calculate effective holiday days considering working days and partial coverage
+            if overlap_start_dt <= overlap_end_dt:
+                # For daily view, we only count if the overlap includes the specific day
+                if view_type == 'daily':
+                    if start_date == end_date and overlap_start_dt.date() <= start_date <= overlap_end_dt.date():
+                        # Check if this specific day is a working day
+                        allowed_weekdays = working_weekdays if working_weekdays is not None else {6, 0, 1, 2, 3}
+                        if start_date.weekday() in allowed_weekdays:
+                            holiday_hours = WORKING_HOURS_PER_DAY
+                            total_holiday_hours += holiday_hours
+                            print(f"  Holiday '{holiday['name']}' covers the working day: {holiday_hours}h")
+                        else:
+                            print(f"  Holiday '{holiday['name']}' falls on non-working day, no hours deducted")
+                else:
+                    # For monthly and weekly views, evaluate per-day overlap and only count full-day equivalents (>=8h)
+                    holiday_hours = 0
+                    allowed_weekdays = working_weekdays if working_weekdays is not None else {6, 0, 1, 2, 3}
+
+                    day_cursor = overlap_start_dt.date()
+                    last_day = overlap_end_dt.date()
+                    max_iterations = 62  # safety for two months span
+                    iter_count = 0
+                    while day_cursor <= last_day and iter_count < max_iterations:
+                        if day_cursor.weekday() in allowed_weekdays:
+                            day_start_dt = datetime.datetime.combine(day_cursor, datetime.time(0, 0, 0))
+                            day_end_dt = datetime.datetime.combine(day_cursor, datetime.time(23, 59, 59))
+                            seg_start = max(overlap_start_dt, day_start_dt)
+                            seg_end = min(overlap_end_dt, day_end_dt)
+                            if seg_end > seg_start:
+                                seg_hours = (seg_end - seg_start).total_seconds() / 3600.0
+                                if seg_hours >= WORKING_HOURS_PER_DAY - 0.1:  # count only if ~full-day coverage
+                                    holiday_hours += WORKING_HOURS_PER_DAY
+                        day_cursor += datetime.timedelta(days=1)
+                        iter_count += 1
+                    
+                    total_holiday_hours += holiday_hours
+                    print(f"  Holiday '{holiday['name']}' ({overlap_start_dt} to {overlap_end_dt}): {holiday_hours}h (full-day equivalents)")
+                    
+                    # Safety check - warn if holiday hours seem too high
+                    if holiday_hours > 200:  # More than 25 working days
+                        print(f"  WARNING: Holiday hours seem very high ({holiday_hours}h) - please check holiday dates")
+            
+        except Exception as e:
+            print(f"Error processing holiday '{holiday.get('name', 'Unknown')}': {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+    
+    # Final safety check - cap holiday hours to reasonable limits
+    max_reasonable_hours = {
+        'daily': 8,      # Max 1 day
+        'weekly': 40,    # Max 1 week
+        'monthly': 200   # Max ~25 working days
+    }
+    
+    max_hours = max_reasonable_hours.get(view_type, 200)
+    if total_holiday_hours > max_hours:
+        print(f"WARNING: Holiday hours ({total_holiday_hours}h) exceed reasonable limit for {view_type} view ({max_hours}h). Capping to {max_hours}h")
+        total_holiday_hours = max_hours
+    
+    print(f"Total holiday hours in period: {total_holiday_hours}h")
+    return total_holiday_hours
+
 def get_designer_ids_from_planning(models, uid, start_date, end_date):
     """Queries planning.slot for the given date range and returns IDs of designers."""
     slots = models.execute_kw(
@@ -1258,7 +1697,7 @@ def get_team_utilization_data(period=None, view_type='monthly'):
         start_date, end_date = get_date_range(view_type, period)
         print(f"Fetching team utilization data for {view_type} view: {start_date} to {end_date}")
         
-        # Find the Creative department
+        # Find the Creative department first
         department_ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'hr.department', 'search', 
                                          [[('name', '=', 'Creative')]])
         
@@ -1273,6 +1712,29 @@ def get_team_utilization_data(period=None, view_type='monthly'):
         if not creative_employee_ids:
             print("No creative employees found")
             return {}
+        
+        # Fetch employee company and compute per-employee holidays for utilization stats
+        employee_company = {}
+        try:
+            emp_company_data = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'hr.employee', 'read', 
+                                              [creative_employee_ids], {'fields': ['company_id']})
+            for emp in emp_company_data:
+                cid = None
+                if emp.get('company_id'):
+                    cid = emp['company_id'][0] if isinstance(emp['company_id'], (list, tuple)) else emp['company_id']
+                employee_company[emp['id']] = cid
+        except Exception as _e:
+            pass
+
+        company_holidays_cache = {}
+        employee_holiday_hours = {}
+        for emp_id in creative_employee_ids:
+            cid = employee_company.get(emp_id)
+            if cid not in company_holidays_cache:
+                holidays = get_public_holidays(models, uid, start_date, end_date, company_id=cid)
+                company_holidays_cache[cid] = holidays
+            holidays = company_holidays_cache.get(cid) or []
+            employee_holiday_hours[emp_id] = calculate_holiday_hours_in_period(holidays, start_date, end_date, view_type)
         
         # Get employee details with tags
         employees_data = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'hr.employee', 'read', 
@@ -1422,7 +1884,7 @@ def get_team_utilization_data(period=None, view_type='monthly'):
             active_creatives = len([emp for emp in team_employees if emp['logged_hours'] > 0])
             
             # Calculate available hours using the same formula as Available Creatives tab
-            # Base Available Hours based on view type - Time Off Hours
+            # Base Available Hours based on view type - Time Off Hours - Holiday Hours
             if view_type == 'monthly':
                 base_available_hours_per_employee = 184  # 184 hours per month
             elif view_type == 'weekly':
@@ -1432,7 +1894,19 @@ def get_team_utilization_data(period=None, view_type='monthly'):
             
             base_available_hours = base_available_hours_per_employee * total_creatives  # Base hours for all employees
             total_time_off_hours = sum(emp.get('time_off_hours', 0) for emp in team_employees)
-            available_hours = base_available_hours - total_time_off_hours
+            
+            # Calculate total holiday hours for this team based on each employee's company-specific holidays
+            total_holiday_hours_for_team = 0
+            for emp_data in team_employees:
+                # Find the employee ID in our data - search by matching names
+                for emp_id, emp_details in employee_data.items():
+                    if emp_details.get('name') == emp_data['name']:
+                        # Get holiday hours for this employee
+                        holiday_hours = employee_holiday_hours.get(emp_id, 0)
+                        total_holiday_hours_for_team += holiday_hours
+                        break
+            
+            available_hours = base_available_hours - total_time_off_hours - total_holiday_hours_for_team
             
             planned_hours = sum(emp['planned_hours'] for emp in team_employees)  # Include all employees, not just active ones
             logged_hours = sum(emp['logged_hours'] for emp in team_employees if emp['logged_hours'] > 0)
@@ -1640,10 +2114,10 @@ def get_available_creative_resources(view_type='monthly', period=None):
             print("No creative employees found")
             return []
         
-        # Get employee details for all creative employees
+        # Get employee details for all creative employees (include resource_id and resource_calendar_id)
         employees_data = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'hr.employee', 'read', 
                                          [creative_employee_ids], {
-                                             'fields': ['name', 'job_title', 'category_ids']
+                                             'fields': ['name', 'job_title', 'category_ids', 'resource_id', 'resource_calendar_id']
                                          })
         
         print(f"Processing {len(employees_data)} employees...")
@@ -1665,16 +2139,15 @@ def get_available_creative_resources(view_type='monthly', period=None):
             except Exception as e:
                 print(f"Error fetching categories for available resources: {e}")
         
-        # Create a dictionary to store employee availability data
+        # Build mapping between hr.employee and planning/resource IDs
         employee_availability = {}
+        employee_to_resource_id = {}
+        resource_id_to_employee = {}
         
-        # Calculate base available hours based on view type
-        if view_type == 'monthly':
-            base_available_hours = 184  # 184 hours per month
-        elif view_type == 'weekly':
-            base_available_hours = 40   # 40 hours per week
-        else:  # daily
-            base_available_hours = 8    # 8 hours per day
+        # Calculate base available hours PER EMPLOYEE using their resource calendars
+        # We initialize with placeholders; will compute per-employee below
+        _, default_base_available_hours = calculate_working_days_and_hours(start_date, end_date)
+        print(f"Default base available hours for {view_type} view ({start_date} to {end_date}): {default_base_available_hours} hours (fallback)")
         
         # Initialize all employees with 0% allocation
         for employee in employees_data:
@@ -1683,15 +2156,26 @@ def get_available_creative_resources(view_type='monthly', period=None):
             if employee.get('category_ids'):
                 tags = [categories_dict.get(cat_id) for cat_id in employee['category_ids'] if categories_dict.get(cat_id)]
             
-            employee_availability[employee['id']] = {
+            # Map resource_id if available
+            if employee.get('resource_id'):
+                # resource_id returns [id, display_name]
+                res_id = employee['resource_id'][0] if isinstance(employee['resource_id'], (list, tuple)) else employee['resource_id']
+                if res_id:
+                    employee_to_resource_id[employee['id']] = res_id
+                    resource_id_to_employee[res_id] = employee['id']
+
+            emp_id = employee['id']
+            # Compute per-employee working days from calendar
+            emp_working_days, emp_base_hours = calculate_employee_working_days_and_hours(models, uid, emp_id, start_date, end_date)
+            employee_availability[emp_id] = {
                 'name': employee.get('name', ''),
                 'job_title': employee.get('job_title', ''),
                 'tags': tags,
                 'allocated_percentage': 0,
                 'planned_hours': 0,
-                'base_available_hours': base_available_hours,
+                'base_available_hours': emp_base_hours,
                 'time_off_hours': 0,
-                'available_hours': base_available_hours,  # Will be updated after time off calculation
+                'available_hours': emp_base_hours,  # Will be updated after time off calculation
                 'start_datetime': start_date,
                 'end_datetime': end_date
             }
@@ -1726,12 +2210,49 @@ def get_available_creative_resources(view_type='monthly', period=None):
                     employee_time_off[emp_id] = 0
                 employee_time_off[emp_id] += float(ts.get('unit_amount', 0))
         
-        # Update employee availability with Time Off hours
+        # Fetch public holidays for each employee's company and compute per-employee holiday hours
+        # Build employee -> company_id mapping
+        employee_company = {}
+        try:
+            emp_company_data = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'hr.employee', 'read', 
+                                              [creative_employee_ids], {'fields': ['company_id']})
+            for emp in emp_company_data:
+                cid = None
+                if emp.get('company_id'):
+                    cid = emp['company_id'][0] if isinstance(emp['company_id'], (list, tuple)) else emp['company_id']
+                employee_company[emp['id']] = cid
+        except Exception as _e:
+            pass
+
+        # Cache holidays per company to avoid repeated reads
+        company_holidays_cache = {}
+        employee_holiday_hours = {}
+        for emp_id in creative_employee_ids:
+            cid = employee_company.get(emp_id)
+            if cid not in company_holidays_cache:
+                holidays = get_public_holidays(models, uid, start_date, end_date, company_id=cid)
+                company_holidays_cache[cid] = holidays
+            holidays = company_holidays_cache.get(cid) or []
+            # Use employee-specific working weekdays for accuracy
+            emp_weekdays = get_employee_working_weekdays(models, uid, emp_id)
+            employee_holiday_hours[emp_id] = calculate_holiday_hours_in_period(holidays, start_date, end_date, view_type, working_weekdays=emp_weekdays)
+        
+        # Update employee availability with Time Off hours and per-employee public holidays using per-employee base
         for emp_id, time_off_hours in employee_time_off.items():
             if emp_id in employee_availability:
                 employee_availability[emp_id]['time_off_hours'] = time_off_hours
-                employee_availability[emp_id]['available_hours'] = base_available_hours - time_off_hours
-                print(f"Employee {employee_availability[emp_id]['name']}: {time_off_hours:.1f}h Time Off, {employee_availability[emp_id]['available_hours']:.1f}h available")
+                emp_base = employee_availability[emp_id]['base_available_hours']
+                emp_holiday = float(employee_holiday_hours.get(emp_id) or 0.0)
+                employee_availability[emp_id]['available_hours'] = emp_base - time_off_hours - emp_holiday
+                print(f"Employee {employee_availability[emp_id]['name']}: {time_off_hours:.1f}h Time Off, {emp_holiday:.1f}h Public Holidays, {employee_availability[emp_id]['available_hours']:.1f}h available")
+        
+        # For employees without time off, still deduct per-employee public holidays
+        for emp_id in employee_availability:
+            if emp_id not in employee_time_off:
+                emp_base = employee_availability[emp_id]['base_available_hours']
+                emp_holiday = float(employee_holiday_hours.get(emp_id) or 0.0)
+                employee_availability[emp_id]['available_hours'] = emp_base - emp_holiday
+                print(f"Employee {employee_availability[emp_id]['name']}: 0h Time Off, {emp_holiday:.1f}h Public Holidays, {employee_availability[emp_id]['available_hours']:.1f}h available")
         
         # Get planning slots for creative employees using resource_id field
         # Convert dates to string format for Odoo
@@ -1739,131 +2260,120 @@ def get_available_creative_resources(view_type='monthly', period=None):
         end_str = end_date.strftime('%Y-%m-%d 23:59:59')
         
         print(f"Searching planning slots from {start_str} to {end_str}")
-        print(f"Looking for planning slots for {len(creative_employee_ids)} creative employees")
+        print(f"Looking for planning slots for {len(employee_to_resource_id)} creative employees (via resource IDs)")
         
         # First, let's check if there are any planning slots at all for these employees
-        all_slots = execute_odoo_call_with_retry(models, uid, 'planning.slot', 'search', 
-                                       [[('resource_id', 'in', creative_employee_ids)]], 
-                                       {'limit': 1000})
-        print(f"Total planning slots found for creative employees (any date): {len(all_slots)}")
+        # Use planning.resource/resource_id values rather than hr.employee IDs
+        resource_ids_for_all = list(employee_to_resource_id.values())
+        all_slots = execute_odoo_call_with_retry(
+            models,
+            uid,
+            'planning.slot',
+            'search',
+            [['|', ('resource_id', 'in', resource_ids_for_all), ('employee_id', 'in', creative_employee_ids)]],
+            {'limit': 1000}
+        )
+        print(f"Total planning slots found for creative employees (any date) using resource or employee IDs: {len(all_slots)}")
         
         if all_slots:
-            # Get a sample of slots to see what dates they have
-            sample_slots = execute_odoo_call_with_retry(models, uid, 'planning.slot', 'read', 
-                                          [all_slots[:5]], {
-                                              'fields': [
-                                                  'resource_id',
-                                                  'start_datetime',
-                                                  'end_datetime',
-                                                  'allocated_hours'
-                                              ]
-                                          })
-            print(f"Sample planning slots (first 5):")
-            for slot in sample_slots:
-                print(f"  - {slot.get('start_datetime')} to {slot.get('end_datetime')} ({slot.get('allocated_hours', 0)}h)")
+            pass
         
-        # Search for planning slots where resource_id is in creative employees
-        # Include slots that overlap with the filter range (start before but end within, or start within but end after)
+        # Search for planning slots overlapping the filter range for all Creative employees/resources
+        # Paginate to avoid the global 1000 results cap
         resource_ids = []
-        max_retries = 3
-        
-        for attempt in range(max_retries):
-            try:
-                resource_ids = execute_odoo_call_with_retry(models, uid, 'planning.slot', 'search', 
-                                           [[('resource_id', 'in', creative_employee_ids),
-                                             ('start_datetime', '<=', end_str),
-                                             ('end_datetime', '>=', start_str)]], 
-                                           {'limit': 1000})
-                if resource_ids:
-                    print(f"Successfully found {len(resource_ids)} planning slots on attempt {attempt + 1}")
+        try:
+            offset = 0
+            page_limit = 1000
+            while True:
+                ids_page = execute_odoo_call_with_retry(
+                    models,
+                    uid,
+                    'planning.slot',
+                    'search',
+                    [['&', '&',
+                      '|', ('resource_id', 'in', resource_ids_for_all), ('employee_id', 'in', creative_employee_ids),
+                      ('start_datetime', '<=', end_str),
+                      ('end_datetime', '>=', start_str)]],
+                    {'limit': page_limit, 'offset': offset}
+                )
+                if not ids_page:
                     break
-                else:
-                    print(f"No planning slots found on attempt {attempt + 1}")
-            except Exception as e:
-                print(f"Error fetching planning slots for Creative (attempt {attempt + 1}): {e}")
-                if attempt < max_retries - 1:
-                    print(f"Retrying in 2 seconds...")
-                    time.sleep(2)
-                else:
-                    print("All attempts failed, proceeding with empty planning slots")
-                    resource_ids = []
+                resource_ids.extend(ids_page)
+                if len(ids_page) < page_limit:
+                    break
+                offset += page_limit
+            print(f"Successfully found {len(resource_ids)} planning slots (paginated)")
+        except Exception as e:
+            print(f"Error fetching planning slots for Creative (paginated): {e}")
+            resource_ids = []
         
         if resource_ids:
-            print(f"Found {len(resource_ids)} planning slots for creative employees")
+            print(f"Found {len(resource_ids)} planning slots for creative employees (resource mapped)")
             
             # Get resource data with employee information
-            resources = execute_odoo_call_with_retry(models, uid, 'planning.slot', 'read', 
-                                        [resource_ids], {
-                                            'fields': [
-                                                'resource_id',
-                                                'start_datetime',
-                                                'end_datetime',
-                                                'allocated_hours'
-                                            ]
-                                        })
+            # Read resources in chunks to avoid payload limits
+            resources = []
+            # Page in smaller chunks to reduce payload pressure
+            read_batch_size = 250
+            for i in range(0, len(resource_ids), read_batch_size):
+                batch_ids = resource_ids[i:i+read_batch_size]
+                batch = execute_odoo_call_with_retry(models, uid, 'planning.slot', 'read', 
+                                            [batch_ids], {
+                                                'fields': [
+                                                    'resource_id',
+                                                    'employee_id',
+                                                    'start_datetime',
+                                                    'end_datetime',
+                                                    'allocated_hours',
+                                                    'allocated_percentage'
+                                                ]
+                                            })
+                resources.extend(batch or [])
             
             print(f"Sample resource data: {resources[0] if resources else 'No resources'}")
             
-            # Group resources by employee and calculate allocation based on view type
+            # Group resources by employee and calculate allocation per-slot using proportional overlap
+            # Overtime preserved by summing all slots; no artificial 8h cap
             employee_resources = {}
             for resource in resources:
-                if resource.get('resource_id') and resource['resource_id'][0] in employee_availability:
-                    employee_id = resource['resource_id'][0]
-                    
-                    if employee_id not in employee_resources:
-                        employee_resources[employee_id] = {
-                            'total_hours': 0,
-                            'slots': []
-                        }
-                    
-                    # Parse task start and end times
-                    task_start = datetime.datetime.strptime(resource['start_datetime'], '%Y-%m-%d %H:%M:%S')
-                    task_end = datetime.datetime.strptime(resource['end_datetime'], '%Y-%m-%d %H:%M:%S')
-                    filter_start = datetime.datetime.strptime(start_str, '%Y-%m-%d %H:%M:%S')
-                    filter_end = datetime.datetime.strptime(end_str, '%Y-%m-%d %H:%M:%S')
-                    
-                    # Calculate allocated hours based on view type
-                    if view_type == 'daily':
-                        # For daily view, calculate only the hours for this specific day
-                        allocated_hours = 0
-                        
-                        # Check if the task overlaps with the specific day
-                        if task_start.date() <= filter_start.date() <= task_end.date():
-                            # Task overlaps with this day
-                            if task_start.date() == task_end.date():
-                                # Task is entirely within this day
-                                allocated_hours = resource.get('allocated_hours', 0)
-                            else:
-                                # Task spans multiple days, calculate proportion for this day
-                                total_task_days = (task_end.date() - task_start.date()).days + 1
-                                total_task_hours = resource.get('allocated_hours', 0)
-                                
-                                # For daily view, assume 8 hours per day
-                                if total_task_days > 1:
-                                    # Distribute hours evenly across days
-                                    allocated_hours = min(8, total_task_hours / total_task_days)
-                                else:
-                                    allocated_hours = min(8, total_task_hours)
-                                
-                                print(f"Daily view: Task spans {total_task_days} days, {total_task_hours}h total, {allocated_hours:.1f}h for this day")
-                        else:
-                            # Task doesn't overlap with this day
-                            allocated_hours = 0
-                    else:
-                        # For weekly/monthly view, use existing logic
-                        allocated_hours = resource.get('allocated_hours', 0)
-                        
-                        # Edge case: Task starts before filter but ends within filter
-                        if task_start < filter_start and task_end >= filter_start:
-                            # Calculate days from filter start to task end
-                            days_in_filter = (task_end.date() - filter_start.date()).days + 1
-                            # Calculate hours: days × 8 hours per day
-                            allocated_hours = days_in_filter * 8
-                            print(f"Edge case detected: Task {resource['start_datetime']} to {resource['end_datetime']} - {days_in_filter} days in filter = {allocated_hours} hours")
-                    
-                    # Add to employee's total
-                    employee_resources[employee_id]['total_hours'] += allocated_hours
-                    employee_resources[employee_id]['slots'].append(resource)
+                employee_id = None
+                # Prefer mapping via planning.resource/resource_id if present
+                if resource.get('resource_id'):
+                    res_id = resource['resource_id'][0] if isinstance(resource['resource_id'], (list, tuple)) else resource['resource_id']
+                    if res_id in resource_id_to_employee:
+                        employee_id = resource_id_to_employee[res_id]
+                # Fallback to employee_id on the slot
+                if employee_id is None and resource.get('employee_id'):
+                    possible_emp_id = resource['employee_id'][0] if isinstance(resource['employee_id'], (list, tuple)) else resource['employee_id']
+                    if possible_emp_id in employee_availability:
+                        employee_id = possible_emp_id
+                if employee_id is None:
+                    continue
+
+                if employee_id not in employee_resources:
+                    employee_resources[employee_id] = {
+                        'total_hours': 0.0,
+                        'slot_count': 0
+                    }
+
+                # Parse times
+                task_start = datetime.datetime.strptime(resource['start_datetime'], '%Y-%m-%d %H:%M:%S')
+                task_end = datetime.datetime.strptime(resource['end_datetime'], '%Y-%m-%d %H:%M:%S')
+                filter_start = datetime.datetime.strptime(start_str, '%Y-%m-%d %H:%M:%S')
+                filter_end = datetime.datetime.strptime(end_str, '%Y-%m-%d %H:%M:%S')
+                # Overlap
+                overlap_start = max(task_start, filter_start)
+                overlap_end = min(task_end, filter_end)
+                if overlap_end <= overlap_start:
+                    continue
+                # Count this slot
+                employee_resources[employee_id]['slot_count'] += 1
+                # Proportional hours
+                slot_total_seconds = max((task_end - task_start).total_seconds(), 0)
+                overlap_seconds = max((overlap_end - overlap_start).total_seconds(), 0)
+                slot_allocated_hours = float(resource.get('allocated_hours', 0) or 0)
+                seg_hours = (slot_allocated_hours * (overlap_seconds / slot_total_seconds)) if slot_total_seconds > 0 else 0.0
+                employee_resources[employee_id]['total_hours'] += seg_hours
             
             # Update employee availability with calculated data
             for employee_id, resource_data in employee_resources.items():
@@ -1877,7 +2387,8 @@ def get_available_creative_resources(view_type='monthly', period=None):
                 employee_availability[employee_id]['allocated_percentage'] = allocated_percentage
                 employee_availability[employee_id]['planned_hours'] = allocated_hours
                 
-                print(f"Employee {employee_availability[employee_id]['name']}: {allocated_hours:.1f}h allocated ({allocated_percentage:.1f}%) from {len(resource_data['slots'])} slots")
+                slot_count = int(resource_data.get('slot_count') or 0)
+                print(f"Employee {employee_availability[employee_id]['name']}: {allocated_hours:.1f}h allocated ({allocated_percentage:.1f}%) from {slot_count} slots")
         else:
             print("No planning slots found for the current week - showing all employees as 100% available")
         
@@ -2023,6 +2534,29 @@ def get_creative_strategy_team_utilization_data(period=None, view_type='monthly'
         # Get date range for the selected period and view type
         start_date, end_date = get_date_range(view_type, period)
         print(f"Fetching Creative Strategy team utilization data for {view_type} view: {start_date} to {end_date}")
+        
+        # Fetch per-employee company and compute individual holiday hours
+        employee_company = {}
+        try:
+            emp_company_data = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'hr.employee', 'read', 
+                                              [creative_employee_ids], {'fields': ['company_id']})
+            for emp in emp_company_data:
+                cid = None
+                if emp.get('company_id'):
+                    cid = emp['company_id'][0] if isinstance(emp['company_id'], (list, tuple)) else emp['company_id']
+                employee_company[emp['id']] = cid
+        except Exception as _e:
+            pass
+
+        company_holidays_cache = {}
+        employee_holiday_hours = {}
+        for emp_id in creative_employee_ids:
+            cid = employee_company.get(emp_id)
+            if cid not in company_holidays_cache:
+                holidays = get_public_holidays(models, uid, start_date, end_date, company_id=cid)
+                company_holidays_cache[cid] = holidays
+            holidays = company_holidays_cache.get(cid) or []
+            employee_holiday_hours[emp_id] = calculate_holiday_hours_in_period(holidays, start_date, end_date, view_type)
         
         # Find the Creative Strategy department
         department_ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'hr.department', 'search', 
@@ -2178,16 +2712,13 @@ def get_creative_strategy_team_utilization_data(period=None, view_type='monthly'
         
         # Calculate available hours using the same formula as Available Creatives tab
         # Base Available Hours based on view type - Time Off Hours
-        if view_type == 'monthly':
-            base_available_hours_per_employee = 184  # 184 hours per month
-        elif view_type == 'weekly':
-            base_available_hours_per_employee = 40   # 40 hours per week
-        else:  # daily
-            base_available_hours_per_employee = 8    # 8 hours per day
+        working_days, base_available_hours_per_employee = calculate_working_days_and_hours(start_date, end_date)
+        print(f"Utilization calculation - base hours per employee: {base_available_hours_per_employee} hours ({working_days} working days)")
         
         base_available_hours = base_available_hours_per_employee * total_creatives  # Base hours for all employees
         total_time_off_hours = sum(emp.get('time_off_hours', 0) for emp in all_employees)
-        available_hours = base_available_hours - total_time_off_hours
+        total_holiday_hours_for_team = 0  # TODO: Calculate holiday hours per employee properly * total_creatives  # Public holidays affect all employees
+        available_hours = base_available_hours - total_time_off_hours - total_holiday_hours_for_team
         
         planned_hours = sum(emp['planned_hours'] for emp in all_employees)  # Include all employees, not just active ones
         logged_hours = sum(emp['logged_hours'] for emp in all_employees if emp['logged_hours'] > 0)
@@ -2376,6 +2907,10 @@ def get_available_creative_strategy_resources(view_type='monthly', period=None):
         start_date, end_date = get_date_range(view_type, period)
         print(f"Analyzing Creative Strategy utilization for {view_type} view: {start_date} to {end_date}")
         
+        # Fetch public holidays for the period (needed for available hours calculation)
+        public_holidays = get_public_holidays(models, uid, start_date, end_date)
+        total_holiday_hours = calculate_holiday_hours_in_period(public_holidays, start_date, end_date, view_type)
+        
         # Find the Creative Strategy department
         department_ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'hr.department', 'search', 
                                          [[('name', '=', 'Creative Strategy')]])
@@ -2424,13 +2959,9 @@ def get_available_creative_strategy_resources(view_type='monthly', period=None):
         # Create a dictionary to store employee availability data
         employee_availability = {}
         
-        # Calculate base available hours based on view type
-        if view_type == 'monthly':
-            base_available_hours = 184  # 184 hours per month
-        elif view_type == 'weekly':
-            base_available_hours = 40   # 40 hours per week
-        else:  # daily
-            base_available_hours = 8    # 8 hours per day
+        # Calculate base available hours based on actual working days in the period
+        working_days, base_available_hours = calculate_working_days_and_hours(start_date, end_date)
+        print(f"Base available hours for Creative Strategy {view_type} view ({start_date} to {end_date}): {base_available_hours} hours ({working_days} working days)")
         
         # Initialize all employees with 0% allocation
         for employee in employees_data:
@@ -2447,7 +2978,7 @@ def get_available_creative_strategy_resources(view_type='monthly', period=None):
                 'planned_hours': 0,
                 'base_available_hours': base_available_hours,
                 'time_off_hours': 0,
-                'available_hours': base_available_hours,  # Will be updated after time off calculation
+                'available_hours': base_available_hours,  # Will be updated after time off and holidays
                 'start_datetime': start_date,
                 'end_datetime': end_date
             }
@@ -2482,12 +3013,43 @@ def get_available_creative_strategy_resources(view_type='monthly', period=None):
                     employee_time_off[emp_id] = 0
                 employee_time_off[emp_id] += float(ts.get('unit_amount', 0))
         
-        # Update employee availability with Time Off hours
+        # Fetch employee company and calculate individual holiday hours
+        employee_company = {}
+        try:
+            emp_company_data = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'hr.employee', 'read', 
+                                              [creative_strategy_employee_ids], {'fields': ['company_id']})
+            for emp in emp_company_data:
+                cid = None
+                if emp.get('company_id'):
+                    cid = emp['company_id'][0] if isinstance(emp['company_id'], (list, tuple)) else emp['company_id']
+                employee_company[emp['id']] = cid
+        except Exception as _e:
+            pass
+
+        company_holidays_cache = {}
+        employee_holiday_hours = {}
+        for emp_id in creative_strategy_employee_ids:
+            cid = employee_company.get(emp_id)
+            if cid not in company_holidays_cache:
+                holidays = get_public_holidays(models, uid, start_date, end_date, company_id=cid)
+                company_holidays_cache[cid] = holidays
+            holidays = company_holidays_cache.get(cid) or []
+            employee_holiday_hours[emp_id] = calculate_holiday_hours_in_period(holidays, start_date, end_date, view_type)
+
+        # Update employee availability with Time Off hours and per-employee public holidays
         for emp_id, time_off_hours in employee_time_off.items():
             if emp_id in employee_availability:
                 employee_availability[emp_id]['time_off_hours'] = time_off_hours
-                employee_availability[emp_id]['available_hours'] = base_available_hours - time_off_hours
-                print(f"Creative Strategy employee {employee_availability[emp_id]['name']}: {time_off_hours:.1f}h Time Off, {employee_availability[emp_id]['available_hours']:.1f}h available")
+                emp_holiday = float(employee_holiday_hours.get(emp_id) or 0.0)
+                employee_availability[emp_id]['available_hours'] = base_available_hours - time_off_hours - emp_holiday
+                print(f"Creative Strategy employee {employee_availability[emp_id]['name']}: {time_off_hours:.1f}h Time Off, {emp_holiday:.1f}h Public Holidays, {employee_availability[emp_id]['available_hours']:.1f}h available")
+        
+        # For employees without time off, still deduct public holidays
+        for emp_id in employee_availability:
+            if emp_id not in employee_time_off:
+                emp_holiday = float(employee_holiday_hours.get(emp_id) or 0.0)
+                employee_availability[emp_id]['available_hours'] = base_available_hours - emp_holiday
+                print(f"Creative Strategy employee {employee_availability[emp_id]['name']}: 0h Time Off, {emp_holiday:.1f}h Public Holidays, {employee_availability[emp_id]['available_hours']:.1f}h available")
         
         # Get planning slots for Creative Strategy employees using resource_id field
         # Convert dates to string format for Odoo
@@ -2794,6 +3356,10 @@ def get_instructional_design_team_utilization_data(period=None, view_type='month
         start_date, end_date = get_date_range(view_type, period)
         print(f"Fetching Instructional Design team utilization data for {view_type} view: {start_date} to {end_date}")
         
+        # Fetch public holidays for the period (needed for available hours calculation)
+        public_holidays = get_public_holidays(models, uid, start_date, end_date)
+        0  # TODO: Calculate holiday hours per employee properly = calculate_holiday_hours_in_period(public_holidays, start_date, end_date, view_type)
+        
         # Find the Instructional Design department - try multiple possible names
         possible_names = [
             'Instructional Design',
@@ -2978,7 +3544,8 @@ def get_instructional_design_team_utilization_data(period=None, view_type='month
             
             base_available_hours = base_available_hours_per_employee * total_creatives  # Base hours for all employees
             total_time_off_hours = sum(emp.get('time_off_hours', 0) for emp in team_employees)
-            available_hours = base_available_hours - total_time_off_hours
+            total_holiday_hours_for_team = 0  # TODO: Calculate holiday hours per employee properly * total_creatives  # Public holidays affect all employees
+            available_hours = base_available_hours - total_time_off_hours - total_holiday_hours_for_team
             
             planned_hours = sum(emp['planned_hours'] for emp in team_employees)  # Include all employees, not just active ones
             logged_hours = sum(emp['logged_hours'] for emp in team_employees if emp['logged_hours'] > 0)
@@ -3190,6 +3757,10 @@ def get_available_instructional_design_resources(view_type='monthly', period=Non
         start_date, end_date = get_date_range(view_type, period)
         print(f"Fetching Instructional Design available resources for {view_type} view: {start_date} to {end_date}")
         
+        # Fetch public holidays for the period (needed for available hours calculation)
+        public_holidays = get_public_holidays(models, uid, start_date, end_date)
+        total_holiday_hours = calculate_holiday_hours_in_period(public_holidays, start_date, end_date, view_type)
+        
         # Find the Instructional Design department - try multiple possible names
         possible_names = [
             'Instructional Design',
@@ -3268,13 +3839,9 @@ def get_available_instructional_design_resources(view_type='monthly', period=Non
         # Create a dictionary to store employee availability data
         employee_availability = {}
         
-        # Calculate base available hours based on view type
-        if view_type == 'monthly':
-            base_available_hours = 184  # 184 hours per month
-        elif view_type == 'weekly':
-            base_available_hours = 40   # 40 hours per week
-        else:  # daily
-            base_available_hours = 8    # 8 hours per day
+        # Calculate base available hours based on actual working days in the period
+        working_days, base_available_hours = calculate_working_days_and_hours(start_date, end_date)
+        print(f"Base available hours for Instructional Design {view_type} view ({start_date} to {end_date}): {base_available_hours} hours ({working_days} working days)")
         
         # Initialize all employees with 0% allocation
         for employee in employees_data:
@@ -3326,12 +3893,20 @@ def get_available_instructional_design_resources(view_type='monthly', period=Non
                     employee_time_off[emp_id] = 0
                 employee_time_off[emp_id] += float(ts.get('unit_amount', 0))
         
-        # Update employee availability with Time Off hours
+        # Update employee availability with Time Off hours and per-employee public holidays
         for emp_id, time_off_hours in employee_time_off.items():
             if emp_id in employee_availability:
                 employee_availability[emp_id]['time_off_hours'] = time_off_hours
-                employee_availability[emp_id]['available_hours'] = base_available_hours - time_off_hours
-                print(f"Instructional Design employee {employee_availability[emp_id]['name']}: {time_off_hours:.1f}h Time Off, {employee_availability[emp_id]['available_hours']:.1f}h available")
+                # Deduct both time off and per-employee public holidays from available hours
+                emp_holiday = float(employee_holiday_hours.get(emp_id) or 0.0)
+                employee_availability[emp_id]['available_hours'] = base_available_hours - time_off_hours - emp_holiday
+                print(f"Instructional Design employee {employee_availability[emp_id]['name']}: {time_off_hours:.1f}h Time Off, {total_holiday_hours:.1f}h Public Holidays, {employee_availability[emp_id]['available_hours']:.1f}h available")
+        
+        # For employees without time off, still deduct public holidays
+        for emp_id in employee_availability:
+            if emp_id not in employee_time_off:
+                employee_availability[emp_id]['available_hours'] = base_available_hours - total_holiday_hours
+                print(f"Instructional Design employee {employee_availability[emp_id]['name']}: 0h Time Off, {total_holiday_hours:.1f}h Public Holidays, {employee_availability[emp_id]['available_hours']:.1f}h available")
         
         # Get planning slots for Instructional Design employees using resource_id field
         # Convert dates to string format for Odoo
@@ -3765,7 +4340,73 @@ def all_departments_data():
         print(f"Request view_type: {view_type}")
         print(f"Request args: {dict(request.args)}")
         
-        # Check cache first
+        # Parse include list (which sections to return)
+        include_param = request.args.get('include')
+        if include_param:
+            include = set([part.strip() for part in include_param.split(',') if part.strip()])
+        else:
+            # Default lean set for first paint
+            include = {'employees', 'team_utilization'}
+
+        selected_department = request.args.get('selected_department')
+        valid_departments = ('Creative', 'Creative Strategy', 'Instructional Design')
+        selected_department = selected_department if selected_department in valid_departments else None
+
+        # Helper to map department names to keys and functions
+        def dept_key_name(name):
+            return 'creative' if name == 'Creative' else 'creative_strategy' if name == 'Creative Strategy' else 'instructional_design'
+
+        def dept_functions(name):
+            if name == 'Creative':
+                return {
+                    'employees': lambda: get_creative_employees(),
+                    'team_utilization': lambda: get_team_utilization_data(period, view_type),
+                    'timesheet_data': lambda: get_creative_timesheet_data(period, view_type),
+                    'available_resources': lambda: get_available_creative_resources(view_type, period)
+                }
+            if name == 'Creative Strategy':
+                return {
+                    'employees': lambda: get_creative_strategy_employees(),
+                    'team_utilization': lambda: get_creative_strategy_team_utilization_data(period, view_type),
+                    'timesheet_data': lambda: get_creative_strategy_timesheet_data(period, view_type),
+                    'available_resources': lambda: get_available_creative_strategy_resources(view_type, period)
+                }
+            # Instructional Design
+            return {
+                'employees': lambda: get_instructional_design_employees(),
+                'team_utilization': lambda: get_instructional_design_team_utilization_data(period, view_type),
+                'timesheet_data': lambda: get_instructional_design_timesheet_data(period, view_type),
+                'available_resources': lambda: get_available_instructional_design_resources(view_type, period)
+            }
+
+        # If a selected_department is specified OR include is lean, build result by department using targeted functions
+        if selected_department or include != {'employees', 'team_utilization'}:
+            print(f"Optimized path: departments={selected_department or 'ALL (lazy)'}, include={sorted(list(include))}")
+            result = {}
+            departments_to_process = [selected_department] if selected_department else list(valid_departments)
+            cache_only = True
+            for dept_name in departments_to_process:
+                key = dept_key_name(dept_name)
+                cached_obj = get_cached_data(key, period, view_type) or {}
+                out_obj = dict(cached_obj) if cached_obj else {}
+                funcs = dept_functions(dept_name)
+                for part in include:
+                    existing = out_obj.get(part)
+                    missing = (existing is None) or (isinstance(existing, (list, dict)) and len(existing) == 0)
+                    if missing:
+                        try:
+                            out_obj[part] = funcs[part]()
+                            cache_only = False
+                        except Exception as e:
+                            print(f"Error computing {part} for {dept_name}: {e}")
+                if out_obj:
+                    set_cached_data(key, out_obj, period, view_type)
+                    result[key] = out_obj
+            result['cached'] = cache_only
+            result['cache_timestamp'] = time.time()
+            return jsonify(result)
+
+        # Check cache first (full payload path)
         cached_creative = get_cached_data('creative', period, view_type)
         cached_creative_strategy = get_cached_data('creative_strategy', period, view_type)
         cached_instructional_design = get_cached_data('instructional_design', period, view_type)
@@ -3780,6 +4421,37 @@ def all_departments_data():
             # Get the cache timestamp for this specific request
             cache_key = f"{period}_{view_type}" if period else f"default_{view_type}"
             cache_timestamp = department_cache['cache_timestamps'].get(cache_key, time.time())
+            
+            # Safety: ensure core fields are populated for each department
+            def _ensure_department_fields(dept_key, dept_name, data_obj):
+                try:
+                    if not data_obj:
+                        return data_obj
+                    needs_employees = len(data_obj.get('employees') or []) == 0
+                    needs_resources = len(data_obj.get('available_resources') or []) == 0
+                    needs_timesheets = len(data_obj.get('timesheet_data') or []) == 0
+                    needs_util = not bool(data_obj.get('team_utilization'))
+                    if not (needs_employees or needs_resources or needs_timesheets or needs_util):
+                        return data_obj
+                    fetched = fetch_department_data_sequential(dept_name, period, view_type)
+                    if not fetched:
+                        return data_obj
+                    if needs_employees and len(fetched.get('employees') or []) > 0:
+                        data_obj['employees'] = fetched['employees']
+                    if needs_resources and len(fetched.get('available_resources') or []) > 0:
+                        data_obj['available_resources'] = fetched['available_resources']
+                    if needs_timesheets and len(fetched.get('timesheet_data') or []) > 0:
+                        data_obj['timesheet_data'] = fetched['timesheet_data']
+                    if needs_util and bool(fetched.get('team_utilization')):
+                        data_obj['team_utilization'] = fetched['team_utilization']
+                    set_cached_data(dept_key, data_obj, period, view_type)
+                except Exception:
+                    pass
+                return data_obj
+
+            cached_creative = _ensure_department_fields('creative', 'Creative', cached_creative)
+            cached_creative_strategy = _ensure_department_fields('creative_strategy', 'Creative Strategy', cached_creative_strategy)
+            cached_instructional_design = _ensure_department_fields('instructional_design', 'Instructional Design', cached_instructional_design)
             
             return jsonify({
                 'creative': cached_creative,
@@ -3848,20 +4520,24 @@ def all_departments_data():
                     result['instructional_design'] = fallback_data
         else:
             # Use parallel processing
+            # If the frontend passes a selected department, prioritize it first
+            selected_department = request.args.get('selected_department')
+            prioritized = []
+            if selected_department in ('Creative', 'Creative Strategy', 'Instructional Design'):
+                prioritized = [selected_department]
+            # Prepare executor
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                 futures = {}
-                
-                if cached_creative is None:
-                    print(f"Fetching Creative department data for period: {period}")
-                    futures['creative'] = executor.submit(fetch_department_data_parallel, 'Creative', period, view_type)
-                
-                if cached_creative_strategy is None:
-                    print(f"Fetching Creative Strategy department data for period: {period}")
-                    futures['creative_strategy'] = executor.submit(fetch_department_data_parallel, 'Creative Strategy', period, view_type)
-                
-                if cached_instructional_design is None:
-                    print(f"Fetching Instructional Design department data for period: {period}")
-                    futures['instructional_design'] = executor.submit(fetch_department_data_parallel, 'Instructional Design', period, view_type)
+                department_order = ['Creative', 'Creative Strategy', 'Instructional Design']
+                # Move prioritized department to front if present
+                if prioritized:
+                    department_order = prioritized + [d for d in department_order if d not in prioritized]
+
+                for dept_name in department_order:
+                    key = 'creative' if dept_name == 'Creative' else 'creative_strategy' if dept_name == 'Creative Strategy' else 'instructional_design'
+                    if locals().get(f"cached_{key}") is None:
+                        print(f"Fetching {dept_name} department data for period: {period}")
+                        futures[key] = executor.submit(fetch_department_data_parallel, dept_name, period, view_type)
                 
                 # Wait for all parallel operations to complete
                 for department, future in futures.items():
@@ -3891,7 +4567,9 @@ def all_departments_data():
                                         'available_resources': get_available_creative_resources(view_type, period)
                                     }
                                 else:
-                                    fallback_data = {
+                                    proper_department_name = get_proper_department_name(department)
+                                    # Use sequential aggregator for all non-creative departments to keep logic unified
+                                    fallback_data = fetch_department_data_sequential(proper_department_name, period, view_type) or {
                                         'employees': get_creative_strategy_employees(),
                                         'team_utilization': get_creative_strategy_team_utilization_data(period, view_type),
                                         'timesheet_data': get_creative_strategy_timesheet_data(period, view_type),
@@ -3952,6 +4630,38 @@ def all_departments_data():
         
         if cached_instructional_design is not None:
             result['instructional_design'] = cached_instructional_design
+        
+        # Safety: ensure each result has core fields populated
+        def _ensure_fields_result(dept_key, dept_name):
+            try:
+                data_obj = result.get(dept_key)
+                if data_obj is None:
+                    return
+                needs_employees = len(data_obj.get('employees') or []) == 0
+                needs_resources = len(data_obj.get('available_resources') or []) == 0
+                needs_timesheets = len(data_obj.get('timesheet_data') or []) == 0
+                needs_util = not bool(data_obj.get('team_utilization'))
+                if not (needs_employees or needs_resources or needs_timesheets or needs_util):
+                    return
+                fetched = fetch_department_data_sequential(dept_name, period, view_type)
+                if not fetched:
+                    return
+                if needs_employees and len(fetched.get('employees') or []) > 0:
+                    data_obj['employees'] = fetched['employees']
+                if needs_resources and len(fetched.get('available_resources') or []) > 0:
+                    data_obj['available_resources'] = fetched['available_resources']
+                if needs_timesheets and len(fetched.get('timesheet_data') or []) > 0:
+                    data_obj['timesheet_data'] = fetched['timesheet_data']
+                if needs_util and bool(fetched.get('team_utilization')):
+                    data_obj['team_utilization'] = fetched['team_utilization']
+                set_cached_data(dept_key, data_obj, period, view_type)
+                result[dept_key] = data_obj
+            except Exception:
+                pass
+
+        _ensure_fields_result('creative', 'Creative')
+        _ensure_fields_result('creative_strategy', 'Creative Strategy')
+        _ensure_fields_result('instructional_design', 'Instructional Design')
         
         result['cached'] = False
         result['cache_timestamp'] = time.time()
