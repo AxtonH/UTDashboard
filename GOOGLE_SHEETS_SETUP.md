@@ -18,11 +18,16 @@ The dashboard now supports two data sources for external hours:
 
 ### 2. Environment Configuration
 
-Add the following variables to your `.env` file:
+Add the following variables to your `.env` file (or Railway Variables):
 
 ```bash
 # Google Sheets Configuration
+# Option A: Path to credentials file (local/dev)
 GOOGLE_SHEETS_CREDENTIALS_FILE=prezboard-4588d34b9c84.json
+
+# Option B: Paste raw JSON (recommended for Railway). If set, FILE is ignored
+GOOGLE_SHEETS_CREDENTIALS_JSON="{"type":"service_account","project_id":"..."}"
+
 GOOGLE_SHEETS_SPREADSHEET_ID=your_google_sheets_spreadsheet_id_here
 ```
 

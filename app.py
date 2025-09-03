@@ -200,12 +200,23 @@ def decimal_hours_to_hm_data(decimal_hours):
 
 # Google Sheets helper functions
 def get_google_sheets_service():
-    """Initialize and return Google Sheets service"""
+    """Initialize and return Google Sheets service.
+    Supports either a file path via GOOGLE_SHEETS_CREDENTIALS_FILE or raw JSON via GOOGLE_SHEETS_CREDENTIALS_JSON.
+    """
     try:
-        credentials = service_account.Credentials.from_service_account_file(
-            GOOGLE_SHEETS_CREDENTIALS_FILE, scopes=SCOPES
-        )
-        service = build('sheets', 'v4', credentials=credentials)
+        creds = None
+        raw_json = os.environ.get('GOOGLE_SHEETS_CREDENTIALS_JSON')
+        if raw_json:
+            try:
+                info = json.loads(raw_json)
+                creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+            except Exception as e:
+                print(f"Invalid GOOGLE_SHEETS_CREDENTIALS_JSON: {e}")
+        if creds is None:
+            creds = service_account.Credentials.from_service_account_file(
+                GOOGLE_SHEETS_CREDENTIALS_FILE, scopes=SCOPES
+            )
+        service = build('sheets', 'v4', credentials=creds)
         return service
     except Exception as e:
         print(f"Error initializing Google Sheets service: {e}")
