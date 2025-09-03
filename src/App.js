@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import axios from 'axios';
 import './App.css';
 
@@ -6,7 +6,7 @@ function App() {
   const [selectedDepartment, setSelectedDepartment] = useState('Creative');
   const [selectedPeriod, setSelectedPeriod] = useState('2025-01');
   const [viewType, setViewType] = useState('monthly');
-  const [activeTab, setActiveTab] = useState('number');
+  const [activeTab, setActiveTab] = useState('utilization');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [employees, setEmployees] = useState([]);
@@ -23,13 +23,49 @@ function App() {
   const [selectedTeamForDetail, setSelectedTeamForDetail] = useState(null);
   const [detailedTeamData, setDetailedTeamData] = useState(null);
   const [fetchProgress, setFetchProgress] = useState(0);
-  const [dataReady, setDataReady] = useState(false); // New state to track when all data is ready
   const [currentCacheKey, setCurrentCacheKey] = useState(''); // Track current cache key (period_viewType)
+  const [shareholders, setShareholders] = useState([]);
+  const [newShareholderEmail, setNewShareholderEmail] = useState('');
+  const [isSending, setIsSending] = useState(false);
+  const [previewHtml, setPreviewHtml] = useState('');
+  const [showPreview, setShowPreview] = useState(false);
+  const [externalHoursData, setExternalHoursData] = useState({
+    ksa: { totalHours: 0, contracts: [] },
+    uae: { totalHours: 0, contracts: [] }
+  });
 
 
 
-  // Function to generate period options based on view type
-  const generatePeriodOptions = (viewType) => {
+  // Helper function to get week date range
+  const getWeekDateRange = useCallback((year, week) => {
+    // Calculate the first Sunday of the year
+    const startOfYear = new Date(year, 0, 1);
+    const daysUntilSunday = (7 - startOfYear.getDay()) % 7;
+    const firstSunday = new Date(startOfYear);
+    firstSunday.setDate(startOfYear.getDate() + daysUntilSunday);
+    
+    // Calculate the start of the requested week (Sunday)
+    const startDate = new Date(firstSunday);
+    startDate.setDate(firstSunday.getDate() + (week - 1) * 7);
+    
+    // Calculate the end of the week (Saturday)
+    const endDate = new Date(startDate);
+    endDate.setDate(startDate.getDate() + 6);
+    
+    const startMonth = startDate.toLocaleDateString('en-US', { month: 'short' });
+    const startDay = startDate.getDate();
+    const endMonth = endDate.toLocaleDateString('en-US', { month: 'short' });
+    const endDay = endDate.getDate();
+    
+    if (startMonth === endMonth) {
+      return `${startMonth} ${startDay}-${endDay}, ${year}`;
+    } else {
+      return `${startMonth} ${startDay} - ${endMonth} ${endDay}, ${year}`;
+    }
+  }, []);
+
+  // Memoized period options generation
+  const periodOptions = useMemo(() => {
     if (viewType === 'monthly') {
       return [
         { value: '2025-01', label: 'January 2025' },
@@ -78,37 +114,27 @@ function App() {
       }
       return days;
     }
-  };
+  }, [viewType, getWeekDateRange]);
 
-    // Helper function to get week date range
-  const getWeekDateRange = (year, week) => {
-    // Calculate the first Sunday of the year
-    const startOfYear = new Date(year, 0, 1);
-    const daysUntilSunday = (7 - startOfYear.getDay()) % 7;
-    const firstSunday = new Date(startOfYear);
-    firstSunday.setDate(startOfYear.getDate() + daysUntilSunday);
+
+
+  // Helper function to format decimal hours consistently
+  const formatDecimalHours = useCallback((decimal) => {
+    if (decimal === 0) return '0h';
     
-    // Calculate the start of the requested week (Sunday)
-    const startDate = new Date(firstSunday);
-    startDate.setDate(firstSunday.getDate() + (week - 1) * 7);
+    let hours = Math.floor(decimal);
+    let minutes = Math.round((decimal - hours) * 60);
     
-    // Calculate the end of the week (Saturday)
-    const endDate = new Date(startDate);
-    endDate.setDate(startDate.getDate() + 6);
-    
-    const startMonth = startDate.toLocaleDateString('en-US', { month: 'short' });
-    const startDay = startDate.getDate();
-    const endMonth = endDate.toLocaleDateString('en-US', { month: 'short' });
-    const endDay = endDate.getDate();
-    
-    if (startMonth === endMonth) {
-      return `${startMonth} ${startDay}-${endDay}, ${year}`;
-    } else {
-      return `${startMonth} ${startDay} - ${endMonth} ${endDay}, ${year}`;
+    // Handle case where rounding minutes gives us 60
+    if (minutes === 60) {
+      hours += 1;
+      minutes = 0;
     }
-  };
-
-
+    
+    if (minutes === 0) return hours === 0 ? '0h' : `${hours}h`;
+    if (hours === 0) return `${minutes}m`;
+    return `${hours}h ${minutes}m`;
+  }, []);
 
   useEffect(() => {
     console.log(`useEffect triggered - selectedPeriod: ${selectedPeriod}, viewType: ${viewType}, selectedDepartment: ${selectedDepartment}`);
@@ -251,6 +277,40 @@ function App() {
     fetchData();
   }, [selectedPeriod, viewType, selectedDepartment]); // Depend on period, view type, and department
 
+  // Load shareholders list on mount
+  useEffect(() => {
+    axios.get('/api/shareholders').then(res => {
+      if (res.data && res.data.success) {
+        setShareholders(res.data.shareholders || []);
+      }
+    }).catch(() => {});
+  }, []);
+
+  // Load external hours data when external-hours tab is active
+  useEffect(() => {
+    if (activeTab === 'external-hours') {
+      console.log('Fetching external hours data...');
+      setLoading(true);
+      
+      axios.get('/api/external-hours')
+        .then(res => {
+          console.log('External hours response:', res.data);
+          if (res.data && res.data.success) {
+            setExternalHoursData(res.data.data);
+          } else if (res.data && res.data.error) {
+            setError(res.data.error);
+          }
+        })
+        .catch(err => {
+          console.error('Error fetching external hours data:', err);
+          setError(err.response?.data?.error || 'Failed to fetch external hours data');
+        })
+        .finally(() => {
+          setLoading(false);
+        });
+    }
+  }, [activeTab]);
+
   const handleRefresh = async () => {
     setIsRefreshing(true);
     setError(null);
@@ -364,12 +424,11 @@ function App() {
     console.log(`Period changed to: ${newPeriod} (view type: ${viewType})`);
     
     // Validate that the new period is valid for the current view type
-    const validOptions = generatePeriodOptions(viewType);
-    const isValidPeriod = validOptions.some(option => option.value === newPeriod);
+    const isValidPeriod = periodOptions.some(option => option.value === newPeriod);
     
     if (!isValidPeriod) {
       console.warn(`Invalid period ${newPeriod} for view type ${viewType}. Using first valid option.`);
-      setSelectedPeriod(validOptions[0].value);
+      setSelectedPeriod(periodOptions[0].value);
     } else {
       setSelectedPeriod(newPeriod);
     }
@@ -378,7 +437,6 @@ function App() {
     setAllDepartmentsData({});
     setCurrentCacheKey(''); // Clear cache key to force fresh data fetch
     setIsRefreshing(true);
-    setDataReady(false);
     
     // Note: Removed auto-refresh to prevent conflicts with useEffect
     // The useEffect will handle data fetching automatically when state updates
@@ -389,21 +447,15 @@ function App() {
     console.log(`Current viewType: ${viewType}, newViewType: ${newViewType}`);
     
     // Reset period to first option of the new view type
-    const newPeriodOptions = generatePeriodOptions(newViewType);
-    const newPeriod = newPeriodOptions[0].value;
-    console.log(`Setting period to: ${newPeriod} (first option of ${newViewType})`);
-    console.log('Available options:', newPeriodOptions.slice(0, 5).map(opt => `${opt.value}: ${opt.label}`));
-    
     // Force a fresh data fetch but keep current data visible
     setAllDepartmentsData({});
     setCurrentCacheKey(''); // Clear cache key to force fresh data fetch
     setIsRefreshing(true);
-    setDataReady(false);
     
     // Update both state values at the same time to trigger useEffect
-    console.log(`About to update state: viewType=${newViewType}, selectedPeriod=${newPeriod}`);
     setViewType(newViewType);
-    setSelectedPeriod(newPeriod);
+    // Reset to first period option when view type changes
+    setSelectedPeriod('2025-01'); // Default to first month
     console.log('State update calls completed');
     
     // Note: Removed auto-refresh to prevent conflicts with useEffect
@@ -422,7 +474,7 @@ function App() {
     });
   };
 
-  const getFilteredEmployees = () => {
+  const filteredEmployees = useMemo(() => {
     if (selectedPoolFilters.length === 0) {
       return employees;
     }
@@ -443,7 +495,7 @@ function App() {
     );
     
     return uniqueEmployees;
-  };
+  }, [employees, selectedPoolFilters]);
 
   const handleResourcePoolFilterClick = (poolName) => {
     if (selectedResourcePoolFilter === poolName) {
@@ -455,7 +507,7 @@ function App() {
     }
   };
 
-  const getFilteredResources = () => {
+  const filteredResources = useMemo(() => {
     if (!selectedResourcePoolFilter) {
       return availableResources;
     }
@@ -464,7 +516,7 @@ function App() {
         tag.trim().toLowerCase() === selectedResourcePoolFilter.trim().toLowerCase()
       )
     );
-  };
+  }, [availableResources, selectedResourcePoolFilter]);
 
   const handleTimesheetPoolFilterClick = (poolName) => {
     if (selectedTimesheetPoolFilter === poolName) {
@@ -476,7 +528,7 @@ function App() {
     }
   };
 
-  const getFilteredTimesheetData = () => {
+  const filteredTimesheetData = useMemo(() => {
     if (!selectedTimesheetPoolFilter) {
       return timesheetData;
     }
@@ -485,7 +537,70 @@ function App() {
         tag.trim().toLowerCase() === selectedTimesheetPoolFilter.trim().toLowerCase()
       )
     );
-  };
+  }, [timesheetData, selectedTimesheetPoolFilter]);
+
+  // Memoized pool statistics calculations
+  const poolCounts = useMemo(() => ({
+    'KSA': employees.filter(emp => emp.tags && emp.tags.some(tag => tag.trim().toLowerCase() === 'ksa')).length,
+    'UAE': employees.filter(emp => emp.tags && emp.tags.some(tag => tag.trim().toLowerCase() === 'uae')).length,
+    'Nightshift': employees.filter(emp => emp.tags && emp.tags.some(tag => tag.trim().toLowerCase() === 'nightshift')).length
+  }), [employees]);
+
+  const activeTimesheetCount = useMemo(() => 
+    timesheetData.filter(employee => (employee.total_hours?.decimal || 0) > 0).length,
+    [timesheetData]
+  );
+
+  const totalLoggedHours = useMemo(() => 
+    timesheetData.reduce((total, employee) => total + (employee.total_hours?.decimal || 0), 0),
+    [timesheetData]
+  );
+
+  // Memoized resource pool statistics  
+  const resourcePoolStats = useMemo(() => ({
+    'KSA': {
+      availableResources: availableResources.filter(resource => 
+        resource.tags && resource.tags.some(tag => tag.trim().toLowerCase() === 'ksa')
+      ).length,
+      totalPlannedHours: availableResources.filter(resource => 
+        resource.tags && resource.tags.some(tag => tag.trim().toLowerCase() === 'ksa')
+      ).reduce((total, resource) => total + (resource.planned_hours?.decimal || 0), 0),
+      totalAvailableHours: availableResources.filter(resource => 
+        resource.tags && resource.tags.some(tag => tag.trim().toLowerCase() === 'ksa')
+      ).reduce((total, resource) => total + (resource.available_hours?.decimal || 0), 0)
+    },
+    'UAE': {
+      availableResources: availableResources.filter(resource => 
+        resource.tags && resource.tags.some(tag => tag.trim().toLowerCase() === 'uae')
+      ).length,
+      totalPlannedHours: availableResources.filter(resource => 
+        resource.tags && resource.tags.some(tag => tag.trim().toLowerCase() === 'uae')
+      ).reduce((total, resource) => total + (resource.planned_hours?.decimal || 0), 0),
+      totalAvailableHours: availableResources.filter(resource => 
+        resource.tags && resource.tags.some(tag => tag.trim().toLowerCase() === 'uae')
+      ).reduce((total, resource) => total + (resource.available_hours?.decimal || 0), 0)
+    },
+    'Nightshift': {
+      availableResources: availableResources.filter(resource => 
+        resource.tags && resource.tags.some(tag => tag.trim().toLowerCase() === 'nightshift')
+      ).length,
+      totalPlannedHours: availableResources.filter(resource => 
+        resource.tags && resource.tags.some(tag => tag.trim().toLowerCase() === 'nightshift')
+      ).reduce((total, resource) => total + (resource.planned_hours?.decimal || 0), 0),
+      totalAvailableHours: availableResources.filter(resource => 
+        resource.tags && resource.tags.some(tag => tag.trim().toLowerCase() === 'nightshift')
+      ).reduce((total, resource) => total + (resource.available_hours?.decimal || 0), 0)
+    }
+  }), [availableResources]);
+
+  const totalResourceHours = useMemo(() => ({
+    totalPlannedHours: availableResources.reduce((total, resource) => 
+      total + (resource.planned_hours?.decimal || 0), 0
+    ),
+    totalAvailableHours: availableResources.reduce((total, resource) => 
+      total + (resource.available_hours?.decimal || 0), 0
+    )
+  }), [availableResources]);
 
   // Function to handle clicking on utilization chart
   const handleUtilizationChartClick = (teamName, teamData) => {
@@ -587,7 +702,13 @@ function App() {
             className={`tab-btn ${activeTab === 'timesheet' ? 'active' : ''}`}
             onClick={() => setActiveTab('timesheet')}
           >
-            ⏱️ Active {selectedDepartment === 'Creative Strategy' || selectedDepartment === 'Instructional Design' ? 'Team Members' : 'Creatives'} ({timesheetData.filter(employee => employee.total_hours > 0).length})
+            ⏱️ Active {selectedDepartment === 'Creative Strategy' || selectedDepartment === 'Instructional Design' ? 'Team Members' : 'Creatives'} ({activeTimesheetCount})
+          </button>
+          <button 
+            className={`tab-btn ${activeTab === 'external-hours' ? 'active' : ''}`}
+            onClick={() => setActiveTab('external-hours')}
+          >
+            🌐 External Hours
           </button>
           <button 
             className={`tab-btn ${activeTab === 'utilization' ? 'active' : ''}`}
@@ -597,8 +718,8 @@ function App() {
           </button>
         </div>
 
-        {/* View Type and Period Selector for Resources, Timesheet, and Utilization Tabs */}
-        {(activeTab === 'resources' || activeTab === 'timesheet' || activeTab === 'utilization') && (
+        {/* View Type and Period Selector for Resources, Timesheet, External Hours, and Utilization Tabs */}
+        {(activeTab === 'resources' || activeTab === 'timesheet' || activeTab === 'external-hours' || activeTab === 'utilization') && (
           <div className="view-selector">
             <div className="view-type-selector">
               <label htmlFor="view-type-select">View Type:</label>
@@ -621,7 +742,7 @@ function App() {
                 onChange={(e) => handlePeriodChange(e.target.value)}
                 className="period-dropdown"
               >
-                {generatePeriodOptions(viewType).map(option => (
+                {periodOptions.map(option => (
                   <option key={option.value} value={option.value}>
                     {option.label}
                   </option>
@@ -646,17 +767,7 @@ function App() {
               <div className="creative-pools-section">
                 <h3>{selectedDepartment} Pools by Tags</h3>
                 <div className="pools-grid">
-                  {(() => {
-                    // Calculate counts for each pool based on tags
-                    const poolCounts = {
-                      'KSA': employees.filter(emp => emp.tags && emp.tags.some(tag => tag.trim().toLowerCase() === 'ksa')).length,
-                      'UAE': employees.filter(emp => emp.tags && emp.tags.some(tag => tag.trim().toLowerCase() === 'uae')).length,
-                      'Nightshift': employees.filter(emp => emp.tags && emp.tags.some(tag => tag.trim().toLowerCase() === 'nightshift')).length
-                    };
-                    
-
-
-                    return Object.entries(poolCounts).map(([poolName, count]) => (
+                  {Object.entries(poolCounts).map(([poolName, count]) => (
                       <div 
                         key={poolName} 
                         className={`pool-card ${selectedPoolFilters.includes(poolName) ? 'active' : ''}`}
@@ -677,8 +788,8 @@ function App() {
                           </div>
                         )}
                       </div>
-                    ));
-                  })()}
+                    ))}
+                
                 </div>
                 {selectedPoolFilters.length > 0 && (
                   <div className="filter-controls">
@@ -689,7 +800,7 @@ function App() {
                       ✕ Clear All Filters
                     </button>
                     <span className="filter-info">
-                      Showing {getFilteredEmployees().length} of {employees.length} {selectedDepartment === 'Creative Strategy' || selectedDepartment === 'Instructional Design' ? 'team members' : 'employees'}
+                      Showing {filteredEmployees.length} of {employees.length} {selectedDepartment === 'Creative Strategy' || selectedDepartment === 'Instructional Design' ? 'team members' : 'employees'}
                       {selectedPoolFilters.length > 1 && (
                         <span className="filter-details">
                           {' '}({selectedPoolFilters.join(', ')} pools selected)
@@ -702,7 +813,7 @@ function App() {
             )}
 
             <div className="employees-section">
-              {getFilteredEmployees().length === 0 ? (
+              {filteredEmployees.length === 0 ? (
                 <div className="no-employees">
                   <p>
                     {selectedPoolFilters.length > 0 
@@ -713,7 +824,7 @@ function App() {
                 </div>
               ) : (
                 <div className="employees-grid">
-                  {getFilteredEmployees().map((employee, index) => (
+                  {filteredEmployees.map((employee, index) => (
                     <div key={index} className="employee-card">
                       <div className="employee-avatar">
                         {employee.name.charAt(0).toUpperCase()}
@@ -759,56 +870,8 @@ function App() {
               <div className="pool-statistics-section">
                 <h3>Pool Statistics</h3>
                 <div className="pool-stats-grid">
-                  {(() => {
-                    // Calculate pool statistics
-                    const poolStats = {
-                      'KSA': {
-                        availableResources: availableResources.filter(resource => 
-                          resource.tags && resource.tags.some(tag => tag.trim().toLowerCase() === 'ksa')
-                        ).length,
-                        totalPlannedHours: availableResources.filter(resource => 
-                          resource.tags && resource.tags.some(tag => tag.trim().toLowerCase() === 'ksa')
-                        ).reduce((total, resource) => total + (resource.planned_hours || 0), 0),
-                        totalAvailableHours: availableResources.filter(resource => 
-                          resource.tags && resource.tags.some(tag => tag.trim().toLowerCase() === 'ksa')
-                        ).reduce((total, resource) => total + (resource.available_hours || 0), 0)
-                      },
-                      'UAE': {
-                        availableResources: availableResources.filter(resource => 
-                          resource.tags && resource.tags.some(tag => tag.trim().toLowerCase() === 'uae')
-                        ).length,
-                        totalPlannedHours: availableResources.filter(resource => 
-                          resource.tags && resource.tags.some(tag => tag.trim().toLowerCase() === 'uae')
-                        ).reduce((total, resource) => total + (resource.planned_hours || 0), 0),
-                        totalAvailableHours: availableResources.filter(resource => 
-                          resource.tags && resource.tags.some(tag => tag.trim().toLowerCase() === 'uae')
-                        ).reduce((total, resource) => total + (resource.available_hours || 0), 0)
-                      },
-                      'Nightshift': {
-                        availableResources: availableResources.filter(resource => 
-                          resource.tags && resource.tags.some(tag => tag.trim().toLowerCase() === 'nightshift')
-                        ).length,
-                        totalPlannedHours: availableResources.filter(resource => 
-                          resource.tags && resource.tags.some(tag => tag.trim().toLowerCase() === 'nightshift')
-                        ).reduce((total, resource) => total + (resource.planned_hours || 0), 0),
-                        totalAvailableHours: availableResources.filter(resource => 
-                          resource.tags && resource.tags.some(tag => tag.trim().toLowerCase() === 'nightshift')
-                        ).reduce((total, resource) => total + (resource.available_hours || 0), 0)
-                      }
-                    };
-
-                    // Calculate total planned hours and available hours for all pools (avoiding double-counting)
-                    // Use the original availableResources to get the true total without duplication
-                    const totalPlannedHours = availableResources.reduce((total, resource) => 
-                      total + (resource.planned_hours || 0), 0
-                    );
-                    const totalAvailableHours = availableResources.reduce((total, resource) => 
-                      total + (resource.available_hours || 0), 0
-                    );
-
-                    return (
-                      <>
-                        {Object.entries(poolStats).map(([poolName, stats]) => (
+                  <>
+                        {Object.entries(resourcePoolStats).map(([poolName, stats]) => (
                           <div 
                             key={poolName} 
                             className={`pool-stat-card ${selectedResourcePoolFilter === poolName ? 'active' : ''}`}
@@ -824,11 +887,11 @@ function App() {
                               </div>
                               <div className="pool-stat-item">
                                 <span className="pool-stat-label">Total Planned Hours:</span>
-                                <span className="pool-stat-value">{(stats.totalPlannedHours || 0).toFixed(1)}h</span>
+                                <span className="pool-stat-value">{formatDecimalHours(stats.totalPlannedHours || 0)}</span>
                               </div>
                               <div className="pool-stat-item">
                                 <span className="pool-stat-label">Available Hours:</span>
-                                <span className="pool-stat-value">{(stats.totalAvailableHours || 0).toFixed(1)}h</span>
+                                <span className="pool-stat-value">{formatDecimalHours(stats.totalAvailableHours || 0)}</span>
                               </div>
                             </div>
                             {selectedResourcePoolFilter === poolName && (
@@ -845,17 +908,15 @@ function App() {
                           <div className="pool-stat-content">
                             <div className="pool-stat-item">
                               <span className="pool-stat-label">Total Planned Hours:</span>
-                              <span className="pool-stat-value">{(totalPlannedHours || 0).toFixed(1)}h</span>
+                              <span className="pool-stat-value">{formatDecimalHours(totalResourceHours.totalPlannedHours || 0)}</span>
                             </div>
                             <div className="pool-stat-item">
                               <span className="pool-stat-label">Total Available Hours:</span>
-                              <span className="pool-stat-value">{(totalAvailableHours || 0).toFixed(1)}h</span>
+                              <span className="pool-stat-value">{formatDecimalHours(totalResourceHours.totalAvailableHours || 0)}</span>
                             </div>
                           </div>
                         </div>
-                      </>
-                    );
-                  })()}
+                  </>
                 </div>
               </div>
             )}
@@ -870,14 +931,14 @@ function App() {
                   ✕ Clear Filter
                 </button>
                 <span className="resource-filter-info">
-                  Showing {getFilteredResources().length} of {availableResources.length} resources
+                  Showing {filteredResources.length} of {availableResources.length} resources
                   {' '}({selectedResourcePoolFilter} pool selected)
                 </span>
               </div>
             )}
 
             <div className="resources-section">
-              {getFilteredResources().length === 0 ? (
+              {filteredResources.length === 0 ? (
                 <div className="no-resources">
                   <p>
                     {selectedResourcePoolFilter 
@@ -888,7 +949,7 @@ function App() {
                 </div>
               ) : (
                 <div className="resources-grid">
-                  {getFilteredResources().map((resource, index) => (
+                  {filteredResources.map((resource, index) => (
                     <div key={index} className="resource-card">
                       <div className="resource-avatar">
                         {resource.name.charAt(0).toUpperCase()}
@@ -905,11 +966,11 @@ function App() {
                           ></div>
                         </div>
                         <p className="availability-text">
-                          {(resource.planned_hours || 0).toFixed(1)}h / {(resource.available_hours || 0).toFixed(1)}h ({Math.round(resource.allocated_percentage || 0)}%)
+                          {resource.planned_hours?.formatted || '0h'} / {resource.available_hours?.formatted || '0h'} ({Math.round(resource.allocated_percentage || 0)}%)
                         </p>
-                        {resource.time_off_hours > 0 && (
+                        {(resource.time_off_hours?.decimal || 0) > 0 && (
                           <p className="time-off-info">
-                            Time Off: {(resource.time_off_hours || 0).toFixed(1)}h
+                            Time Off: {resource.time_off_hours?.formatted || '0h'}
                           </p>
                         )}
                       </div>
@@ -926,13 +987,11 @@ function App() {
             <div className="stats">
               <div className="stat-card">
                 <h3>Active {selectedDepartment === 'Creative Strategy' || selectedDepartment === 'Instructional Design' ? 'Team Members' : 'Creatives'}</h3>
-                <p className="stat-number">{timesheetData.filter(employee => (employee.total_hours || 0) > 0).length}</p>
+                <p className="stat-number">{activeTimesheetCount}</p>
               </div>
               <div className="stat-card">
                 <h3>Total Logged Hours</h3>
-                <p className="stat-number">
-                  {timesheetData.reduce((total, employee) => total + (employee.total_hours || 0), 0).toFixed(1)}
-                </p>
+                <p className="stat-number">{formatDecimalHours(totalLoggedHours)}</p>
               </div>
             </div>
 
@@ -946,34 +1005,34 @@ function App() {
                     const timesheetPoolStats = {
                       'KSA': {
                         activeCreatives: timesheetData.filter(employee => 
-                          employee.tags && employee.tags.some(tag => tag.trim().toLowerCase() === 'ksa') && (employee.total_hours || 0) > 0
+                          employee.tags && employee.tags.some(tag => tag.trim().toLowerCase() === 'ksa') && (employee.total_hours?.decimal || 0) > 0
                         ).length,
                         totalLoggedHours: timesheetData.filter(employee => 
                           employee.tags && employee.tags.some(tag => tag.trim().toLowerCase() === 'ksa')
-                        ).reduce((total, employee) => total + (employee.total_hours || 0), 0)
+                        ).reduce((total, employee) => total + (employee.total_hours?.decimal || 0), 0)
                       },
                       'UAE': {
                         activeCreatives: timesheetData.filter(employee => 
-                          employee.tags && employee.tags.some(tag => tag.trim().toLowerCase() === 'uae') && (employee.total_hours || 0) > 0
+                          employee.tags && employee.tags.some(tag => tag.trim().toLowerCase() === 'uae') && (employee.total_hours?.decimal || 0) > 0
                         ).length,
                         totalLoggedHours: timesheetData.filter(employee => 
                           employee.tags && employee.tags.some(tag => tag.trim().toLowerCase() === 'uae')
-                        ).reduce((total, employee) => total + (employee.total_hours || 0), 0)
+                        ).reduce((total, employee) => total + (employee.total_hours?.decimal || 0), 0)
                       },
                       'Nightshift': {
                         activeCreatives: timesheetData.filter(employee => 
-                          employee.tags && employee.tags.some(tag => tag.trim().toLowerCase() === 'nightshift') && (employee.total_hours || 0) > 0
+                          employee.tags && employee.tags.some(tag => tag.trim().toLowerCase() === 'nightshift') && (employee.total_hours?.decimal || 0) > 0
                         ).length,
                         totalLoggedHours: timesheetData.filter(employee => 
                           employee.tags && employee.tags.some(tag => tag.trim().toLowerCase() === 'nightshift')
-                        ).reduce((total, employee) => total + (employee.total_hours || 0), 0)
+                        ).reduce((total, employee) => total + (employee.total_hours?.decimal || 0), 0)
                       }
                     };
 
                     // Calculate total logged hours for all pools (avoiding double-counting)
                     // Use the original timesheetData to get the true total without duplication
                     const totalLoggedHours = timesheetData.reduce((total, employee) => 
-                      total + (employee.total_hours || 0), 0
+                      total + (employee.total_hours?.decimal || 0), 0
                     );
 
                     return (
@@ -994,7 +1053,14 @@ function App() {
                               </div>
                               <div className="timesheet-pool-stat-item">
                                 <span className="timesheet-pool-stat-label">Logged Hours:</span>
-                                <span className="timesheet-pool-stat-value">{(stats.totalLoggedHours || 0).toFixed(1)}h</span>
+                                <span className="timesheet-pool-stat-value">{(() => {
+                                  const decimal = stats.totalLoggedHours || 0;
+                                  const hours = Math.floor(decimal);
+                                  const minutes = Math.round((decimal - hours) * 60);
+                                  if (minutes === 0) return hours === 0 ? '0h' : `${hours}h`;
+                                  if (hours === 0) return `${minutes}m`;
+                                  return `${hours}h ${minutes}m`;
+                                })()}</span>
                               </div>
                             </div>
                             {selectedTimesheetPoolFilter === poolName && (
@@ -1011,7 +1077,14 @@ function App() {
                           <div className="timesheet-pool-stat-content">
                             <div className="timesheet-pool-stat-item">
                               <span className="timesheet-pool-stat-label">Total Logged Hours:</span>
-                              <span className="timesheet-pool-stat-value">{(totalLoggedHours || 0).toFixed(1)}h</span>
+                              <span className="timesheet-pool-stat-value">{(() => {
+                                const decimal = totalLoggedHours || 0;
+                                const hours = Math.floor(decimal);
+                                const minutes = Math.round((decimal - hours) * 60);
+                                if (minutes === 0) return hours === 0 ? '0h' : `${hours}h`;
+                                if (hours === 0) return `${minutes}m`;
+                                return `${hours}h ${minutes}m`;
+                              })()}</span>
                             </div>
                           </div>
                         </div>
@@ -1032,14 +1105,14 @@ function App() {
                   ✕ Clear Filter
                 </button>
                 <span className="timesheet-filter-info">
-                  Showing {getFilteredTimesheetData().length} of {timesheetData.length} employees
+                  Showing {filteredTimesheetData.length} of {timesheetData.length} employees
                   {' '}({selectedTimesheetPoolFilter} pool selected)
                 </span>
               </div>
             )}
 
             <div className="timesheet-section">
-              {getFilteredTimesheetData().length === 0 ? (
+              {filteredTimesheetData.length === 0 ? (
                 <div className="no-timesheet">
                   <p>
                     {selectedTimesheetPoolFilter 
@@ -1050,38 +1123,52 @@ function App() {
                 </div>
               ) : (
                 <div className="timesheet-grid">
-                  {getFilteredTimesheetData().map((employee, index) => (
+                  {filteredTimesheetData.map((employee, index) => (
                     <div key={index} className="timesheet-card">
                       <div className="timesheet-header">
-                        <div className="timesheet-avatar">
-                          {employee.name.charAt(0).toUpperCase()}
-                        </div>
                         <div className="timesheet-info">
                           <h3 className="timesheet-name">{employee.name}</h3>
-                          {employee.job_title && (
-                            <p className="timesheet-title">{employee.job_title}</p>
-                          )}
                         </div>
-                        <div className="timesheet-hours">
-                          <span className="hours-number">{(employee.total_hours || 0).toFixed(1)}h</span>
-                          <span className="hours-label">Logged Hours</span>
+                        <div className="hours-group">
+                          <div className="hour-block">
+                            <span className="hours-number">{employee.total_hours?.formatted || '0h'}</span>
+                            <span className="hours-label">Logged</span>
+                          </div>
+                          <div className="hour-block">
+                            <span className="hours-number">{(() => {
+                              const totalDecimal = employee.total_hours?.decimal || 0;
+                              const unbilledDecimal = employee.unbilled_hours?.decimal || 0;
+                              const billedDecimal = Math.max(0, totalDecimal - unbilledDecimal);
+                              const hours = Math.floor(billedDecimal);
+                              const minutes = Math.round((billedDecimal - hours) * 60);
+                              if (minutes === 0) return hours === 0 ? '0h' : `${hours}h`;
+                              if (hours === 0) return `${minutes}m`;
+                              return `${hours}h ${minutes}m`;
+                            })()}</span>
+                            <span className="hours-label">Billed</span>
+                          </div>
+                          {typeof employee.unbilled_hours !== 'undefined' && (
+                            <div className="hour-block">
+                              <span className="hours-number">{employee.unbilled_hours?.formatted || '0h'}</span>
+                              <span className="hours-label">Unbilled</span>
+                            </div>
+                          )}
                         </div>
                       </div>
                       
                       {employee.timesheet_entries && employee.timesheet_entries.length > 0 && (
                         <div className="timesheet-entries">
-                          <h4>Timesheet Entries</h4>
                           <div className="entries-list">
-                            {employee.timesheet_entries.slice(0, 5).map((entry, entryIndex) => (
+                            {employee.timesheet_entries.slice(0, 3).map((entry, entryIndex) => (
                               <div key={entryIndex} className="entry-item">
-                                <span className="entry-hours">{(entry.hours || 0).toFixed(1)}h</span>
+                                <span className="entry-hours">{entry.hours?.formatted || '0h'}</span>
                                 <span className="entry-task">{entry.task || 'No Task'}</span>
                                 <span className="entry-date">{entry.date || 'No Date'}</span>
                               </div>
                             ))}
-                            {employee.timesheet_entries.length > 5 && (
+                            {employee.timesheet_entries.length > 3 && (
                               <div className="more-entries">
-                                +{employee.timesheet_entries.length - 5} more entries
+                                +{employee.timesheet_entries.length - 3} more entries
                               </div>
                             )}
                           </div>
@@ -1091,6 +1178,107 @@ function App() {
                   ))}
                 </div>
               )}
+            </div>
+          </div>
+        )}
+
+        {activeTab === 'external-hours' && (
+          <div className="tab-content">
+            <div className="external-hours-dashboard">
+              <h2>External Hours Dashboard</h2>
+              <p>Calculate external hours for KSA and UAE pools based on retainer contracts with 'In Progress' subscription status.</p>
+              
+              <div className="external-hours-stats">
+                <div className="pool-stats">
+                  <div className="pool-stat-card">
+                    <h3>🇸🇦 KSA Pool</h3>
+                    <div className="stat-number">{formatDecimalHours(externalHoursData.ksa.totalHours)}</div>
+                    <div className="stat-label">Total External Hours</div>
+                    <div className="contracts-count">{externalHoursData.ksa.contracts.length} Active Contracts</div>
+                  </div>
+                  
+                  <div className="pool-stat-card">
+                    <h3>🇦🇪 UAE Pool</h3>
+                    <div className="stat-number">{formatDecimalHours(externalHoursData.uae.totalHours)}</div>
+                    <div className="stat-label">Total External Hours</div>
+                    <div className="contracts-count">{externalHoursData.uae.contracts.length} Active Contracts</div>
+                  </div>
+                  
+                  <div className="pool-stat-card total-stat">
+                    <h3>📊 Total</h3>
+                    <div className="stat-number">
+                      {formatDecimalHours(externalHoursData.ksa.totalHours + externalHoursData.uae.totalHours)}
+                    </div>
+                    <div className="stat-label">Combined External Hours</div>
+                    <div className="contracts-count">
+                      {externalHoursData.ksa.contracts.length + externalHoursData.uae.contracts.length} Total Contracts
+                    </div>
+                  </div>
+                </div>
+                
+                <div className="contracts-details">
+                  <h3>Contract Details</h3>
+                  <div className="contracts-grid">
+                    {/* KSA Contracts */}
+                    <div className="contracts-section">
+                      <h4>🇸🇦 KSA Contracts ({externalHoursData.ksa.contracts.length})</h4>
+                      {externalHoursData.ksa.contracts.length === 0 ? (
+                        <div className="no-contracts">No KSA contracts found with 'In Progress' status</div>
+                      ) : (
+                        <div className="contracts-list">
+                          {externalHoursData.ksa.contracts.map((contract, index) => (
+                            <div key={index} className="contract-card">
+                              <div className="contract-header">
+                                <h5>{contract.partner_name}</h5>
+                                <span className="contract-status">{contract.subscription_status}</span>
+                              </div>
+                              <div className="contract-details">
+                                <div className="contract-hours">
+                                  <span className="hours-label">External Hours:</span>
+                                  <span className="hours-value">{formatDecimalHours(contract.external_hours || 0)}</span>
+                                </div>
+                                <div className="contract-market">
+                                  <span className="market-label">Market:</span>
+                                  <span className="market-value">{contract.market}</span>
+                                </div>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                    
+                    {/* UAE Contracts */}
+                    <div className="contracts-section">
+                      <h4>🇦🇪 UAE Contracts ({externalHoursData.uae.contracts.length})</h4>
+                      {externalHoursData.uae.contracts.length === 0 ? (
+                        <div className="no-contracts">No UAE contracts found with 'In Progress' status</div>
+                      ) : (
+                        <div className="contracts-list">
+                          {externalHoursData.uae.contracts.map((contract, index) => (
+                            <div key={index} className="contract-card">
+                              <div className="contract-header">
+                                <h5>{contract.partner_name}</h5>
+                                <span className="contract-status">{contract.subscription_status}</span>
+                              </div>
+                              <div className="contract-details">
+                                <div className="contract-hours">
+                                  <span className="hours-label">External Hours:</span>
+                                  <span className="hours-value">{formatDecimalHours(contract.external_hours || 0)}</span>
+                                </div>
+                                <div className="contract-market">
+                                  <span className="market-label">Market:</span>
+                                  <span className="market-value">{contract.market}</span>
+                                </div>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
         )}
@@ -1154,15 +1342,36 @@ function App() {
                           </div>
                           <div className="stat-row">
                             <span className="stat-label">Available Hours:</span>
-                            <span className="stat-value">{(teamData.available_hours || 0).toFixed(1)}h</span>
+                            <span className="stat-value">{(() => {
+                              const decimal = teamData.available_hours || 0;
+                              const hours = Math.floor(decimal);
+                              const minutes = Math.round((decimal - hours) * 60);
+                              if (minutes === 0) return hours === 0 ? '0h' : `${hours}h`;
+                              if (hours === 0) return `${minutes}m`;
+                              return `${hours}h ${minutes}m`;
+                            })()}</span>
                           </div>
                           <div className="stat-row">
                             <span className="stat-label">Planned Hours:</span>
-                            <span className="stat-value">{(teamData.planned_hours || 0).toFixed(1)}h</span>
+                            <span className="stat-value">{(() => {
+                              const decimal = teamData.planned_hours || 0;
+                              const hours = Math.floor(decimal);
+                              const minutes = Math.round((decimal - hours) * 60);
+                              if (minutes === 0) return hours === 0 ? '0h' : `${hours}h`;
+                              if (hours === 0) return `${minutes}m`;
+                              return `${hours}h ${minutes}m`;
+                            })()}</span>
                           </div>
                           <div className="stat-row">
                             <span className="stat-label">Logged Hours:</span>
-                            <span className="stat-value">{(teamData.logged_hours || 0).toFixed(1)}h</span>
+                            <span className="stat-value">{(() => {
+                              const decimal = teamData.logged_hours || 0;
+                              const hours = Math.floor(decimal);
+                              const minutes = Math.round((decimal - hours) * 60);
+                              if (minutes === 0) return hours === 0 ? '0h' : `${hours}h`;
+                              if (hours === 0) return `${minutes}m`;
+                              return `${hours}h ${minutes}m`;
+                            })()}</span>
                           </div>
                           <div className="stat-row variance">
                             <span className="stat-label">Variance:</span>
@@ -1215,17 +1424,38 @@ function App() {
                           <span className="stat-label">No. Active {selectedDepartment === 'Creative Strategy' || selectedDepartment === 'Instructional Design' ? 'Team Members' : 'Creatives'}:</span>
                           <span className="stat-value">{teamData.active_creatives}</span>
                         </div>
-                        <div className="stat-row">
+                                                <div className="stat-row">
                           <span className="stat-label">Available Hours:</span>
-                                                      <span className="stat-value">{(teamData.available_hours || 0).toFixed(1)}h</span>
+                          <span className="stat-value">{(() => {
+                            const decimal = teamData.available_hours || 0;
+                            const hours = Math.floor(decimal);
+                            const minutes = Math.round((decimal - hours) * 60);
+                            if (minutes === 0) return hours === 0 ? '0h' : `${hours}h`;
+                            if (hours === 0) return `${minutes}m`;
+                            return `${hours}h ${minutes}m`;
+                          })()}</span>
                         </div>
                         <div className="stat-row">
                           <span className="stat-label">Planned Hours:</span>
-                                                      <span className="stat-value">{(teamData.planned_hours || 0).toFixed(1)}h</span>
+                          <span className="stat-value">{(() => {
+                            const decimal = teamData.planned_hours || 0;
+                            const hours = Math.floor(decimal);
+                            const minutes = Math.round((decimal - hours) * 60);
+                            if (minutes === 0) return hours === 0 ? '0h' : `${hours}h`;
+                            if (hours === 0) return `${minutes}m`;
+                            return `${hours}h ${minutes}m`;
+                          })()}</span>
                         </div>
                         <div className="stat-row">
                           <span className="stat-label">Logged Hours:</span>
-                                                      <span className="stat-value">{(teamData.logged_hours || 0).toFixed(1)}h</span>
+                          <span className="stat-value">{(() => {
+                            const decimal = teamData.logged_hours || 0;
+                            const hours = Math.floor(decimal);
+                            const minutes = Math.round((decimal - hours) * 60);
+                            if (minutes === 0) return hours === 0 ? '0h' : `${hours}h`;
+                            if (hours === 0) return `${minutes}m`;
+                            return `${hours}h ${minutes}m`;
+                          })()}</span>
                         </div>
                         <div className="stat-row variance">
                           <span className="stat-label">Variance:</span>
@@ -1244,6 +1474,90 @@ function App() {
                   <p>No team utilization data found for the selected period</p>
                 </div>
               )}
+              
+              {/* Shareholder Updates Management */}
+              <div className="shareholder-section">
+                <h3>Shareholder Updates</h3>
+                <p className="shareholder-subtext">Send weekly utilization summaries (weekly view) to saved emails.</p>
+                <div className="shareholder-controls">
+                  <input 
+                    type="email"
+                    placeholder="Add shareholder email"
+                    value={newShareholderEmail}
+                    onChange={(e) => setNewShareholderEmail(e.target.value)}
+                    className="shareholder-input"
+                  />
+                  <button 
+                    className="shareholder-btn add"
+                    onClick={async () => {
+                      if (!newShareholderEmail) return;
+                      try {
+                        const res = await axios.post('/api/shareholders', { email: newShareholderEmail });
+                        if (res.data && res.data.success) {
+                          setShareholders(res.data.shareholders || []);
+                          setNewShareholderEmail('');
+                        }
+                      } catch (_) {}
+                    }}
+                  >Add</button>
+                  <button 
+                    className="shareholder-btn preview"
+                    onClick={async () => {
+                      try {
+                        const res = await axios.get('/api/shareholders/preview-weekly');
+                        if (res.data && res.data.success) {
+                          setPreviewHtml(res.data.html || '');
+                          setShowPreview(true);
+                        }
+                      } catch (_) {}
+                    }}
+                  >Preview</button>
+                  <button 
+                    className={`shareholder-btn send ${isSending ? 'disabled' : ''}`}
+                    disabled={isSending}
+                    onClick={async () => {
+                      setIsSending(true);
+                      try {
+                        await axios.post('/api/shareholders/send-weekly', {});
+                      } catch (_) {}
+                      setIsSending(false);
+                    }}
+                  >{isSending ? 'Sending...' : 'Send Weekly Now'}</button>
+                </div>
+                
+                <div className="shareholder-list">
+                  {shareholders.length === 0 ? (
+                    <div className="no-shareholders">No shareholders saved yet.</div>
+                  ) : (
+                    shareholders.map((email, idx) => (
+                      <div key={idx} className="shareholder-item">
+                        <span className="shareholder-email">{email}</span>
+                        <div className="shareholder-actions">
+                          <button 
+                            className="shareholder-btn test"
+                            onClick={async () => {
+                              try {
+                                await axios.post('/api/shareholders/send-test', { email });
+                              } catch (_) {}
+                            }}
+                          >Send Test</button>
+                          <button 
+                            className="shareholder-btn remove"
+                            onClick={async () => {
+                              try {
+                                const res = await axios.delete('/api/shareholders', { data: { email } });
+                                if (res.data && res.data.success) {
+                                  setShareholders(res.data.shareholders || []);
+                                }
+                              } catch (_) {}
+                            }}
+                          >Remove</button>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
             </div>
           </div>
         )}
@@ -1284,8 +1598,32 @@ function App() {
                       {detailedTeamData.employees.map((employee, index) => (
                         <div key={index} className="creative-detail-card">
                           <div className="creative-header">
-                            <div className="creative-avatar">
-                              {employee.name.charAt(0).toUpperCase()}
+                            <div className="creative-utilization-display">
+                              {(() => {
+                                // Calculate individual utilization rate
+                                const availableHours = employee.time_off_hours ? (184 - (employee.time_off_hours || 0)) : 184;
+                                const plannedHours = employee.planned_hours || 0;
+                                const utilizationRate = availableHours > 0 ? (plannedHours / availableHours * 100) : 0;
+                                
+                                return (
+                                  <div className="utilization-circle">
+                                    <div 
+                                      className="utilization-gauge-small"
+                                      style={{
+                                        background: `conic-gradient(
+                                          #4CAF50 0deg ${utilizationRate * 3.6}deg,
+                                          #e0e0e0 ${utilizationRate * 3.6}deg 360deg
+                                        )`
+                                      }}
+                                    >
+                                      <div className="utilization-inner-small">
+                                        <div className="employee-initials">{employee.name.charAt(0).toUpperCase()}</div>
+                                        <div className="utilization-percentage">{utilizationRate.toFixed(0)}%</div>
+                                      </div>
+                                    </div>
+                                  </div>
+                                );
+                              })()}
                             </div>
                             <div className="creative-info">
                               <h4 className="creative-name">{employee.name}</h4>
@@ -1306,27 +1644,35 @@ function App() {
                           </div>
                           
                           <div className="creative-hours">
-                            <div className="hours-row">
+                                                        <div className="hours-row">
                               <span className="hours-label">Available Hours:</span>
                               <span className="hours-value">
-                                {employee.time_off_hours ? 
-                                  (184 - (employee.time_off_hours || 0)).toFixed(1) : 
-                                  '184.0'
-                                }h
+                                {formatDecimalHours(employee.time_off_hours ? (184 - (employee.time_off_hours || 0)) : 184)}
                               </span>
                             </div>
                             <div className="hours-row">
                               <span className="hours-label">Planned Hours:</span>
-                                                              <span className="hours-value">{(employee.planned_hours || 0).toFixed(1)}h</span>
+                              <span className="hours-value">{formatDecimalHours(employee.planned_hours || 0)}</span>
                             </div>
                             <div className="hours-row">
                               <span className="hours-label">Logged Hours:</span>
-                                                              <span className="hours-value">{(employee.logged_hours || 0).toFixed(1)}h</span>
+                              <span className="hours-value">{formatDecimalHours(employee.logged_hours || 0)}</span>
+                            </div>
+                            <div className="hours-row utilization-rate">
+                              <span className="hours-label">Utilization Rate:</span>
+                              <span className="hours-value utilization-value">
+                                {(() => {
+                                  const availableHours = employee.time_off_hours ? (184 - (employee.time_off_hours || 0)) : 184;
+                                  const plannedHours = employee.planned_hours || 0;
+                                  const utilizationRate = availableHours > 0 ? (plannedHours / availableHours * 100) : 0;
+                                  return `${utilizationRate.toFixed(1)}%`;
+                                })()}
+                              </span>
                             </div>
                             {employee.time_off_hours > 0 && (
                               <div className="hours-row time-off">
                                 <span className="hours-label">Time Off:</span>
-                                <span className="hours-value">{(employee.time_off_hours || 0).toFixed(1)}h</span>
+                                <span className="hours-value">{formatDecimalHours(employee.time_off_hours || 0)}</span>
                               </div>
                             )}
                           </div>
@@ -1362,6 +1708,21 @@ function App() {
           >
             {isRefreshing ? '⏳ Refreshing...' : '🔄 Refresh'}
           </button>
+        </div>
+      )}
+
+      {/* Preview Modal */}
+      {showPreview && (
+        <div className="modal-overlay" onClick={() => setShowPreview(false)}>
+          <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2>Weekly Email Preview</h2>
+              <button className="modal-close-btn" onClick={() => setShowPreview(false)}>✕</button>
+            </div>
+            <div className="modal-body">
+              <div dangerouslySetInnerHTML={{ __html: previewHtml }} />
+            </div>
+          </div>
         </div>
       )}
     </div>
