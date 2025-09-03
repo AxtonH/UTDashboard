@@ -4,10 +4,15 @@ import './App.css';
 
 function App() {
   const [selectedDepartment, setSelectedDepartment] = useState('Creative');
-  const [selectedPeriod, setSelectedPeriod] = useState('2025-01');
+  const [selectedPeriod, setSelectedPeriod] = useState(() => {
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    return `${year}-${month}`;
+  });
   const [viewType, setViewType] = useState('monthly');
-  const [activeTab, setActiveTab] = useState('utilization');
-  const [loading, setLoading] = useState(true);
+  const [activeTab, setActiveTab] = useState('resources');
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [employees, setEmployees] = useState([]);
   const [teamUtilizationData, setTeamUtilizationData] = useState({});
@@ -23,16 +28,69 @@ function App() {
   const [selectedTeamForDetail, setSelectedTeamForDetail] = useState(null);
   const [detailedTeamData, setDetailedTeamData] = useState(null);
   const [fetchProgress, setFetchProgress] = useState(0);
-  const [currentCacheKey, setCurrentCacheKey] = useState(''); // Track current cache key (period_viewType)
   const [shareholders, setShareholders] = useState([]);
   const [newShareholderEmail, setNewShareholderEmail] = useState('');
   const [isSending, setIsSending] = useState(false);
   const [previewHtml, setPreviewHtml] = useState('');
   const [showPreview, setShowPreview] = useState(false);
   const [externalHoursData, setExternalHoursData] = useState({
-    ksa: { totalHours: 0, contracts: [] },
-    uae: { totalHours: 0, contracts: [] }
+    ksa: { totalHours: 0, contracts: [], orders: [] },
+    uae: { totalHours: 0, contracts: [], orders: [] }
   });
+  const [externalHoursCache, setExternalHoursCache] = useState({
+    cached: false,
+    last_updated: null,
+    data: null
+  });
+  const [salesOrderHoursData, setSalesOrderHoursData] = useState({
+    ksa: { totalHours: 0, orders: [] },
+    uae: { totalHours: 0, orders: [] }
+  });
+  const [salesOrderHoursCache, setSalesOrderHoursCache] = useState({
+    cached: false,
+    last_updated: null,
+    data: null
+  });
+
+  const [dashboardCache, setDashboardCache] = useState({});
+  
+  const buildDashboardCacheKey = useCallback((dept, period, vtype) => `${dept}|${vtype}|${period}`, []);
+  
+  const applyDepartmentData = useCallback((deptData) => {
+    setEmployees(deptData.employees || []);
+    setTeamUtilizationData(deptData.team_utilization || {});
+    setTimesheetData(deptData.timesheet_data || []);
+    setAvailableResources(deptData.available_resources || []);
+  }, []);
+  
+  const getDepartmentData = useCallback((departmentName) => {
+    const deptKey = departmentName === 'Creative Strategy' ? 'creative_strategy' : 
+                   (departmentName === 'Instructional Design' ? 'instructional_design' : 'creative');
+    return allDepartmentsData[deptKey] || {};
+  }, [allDepartmentsData]);
+  
+  const prePopulateAllTabs = useCallback(() => {
+    // This function ensures all tabs have data populated for the current department
+    console.log(`Pre-populating all tabs for department: ${selectedDepartment}`);
+    const currentDeptData = getDepartmentData(selectedDepartment);
+    console.log(`Current dept data available:`, {
+      hasEmployees: !!(currentDeptData.employees && currentDeptData.employees.length > 0),
+      hasResources: !!(currentDeptData.available_resources && currentDeptData.available_resources.length > 0),
+      hasTimesheet: !!(currentDeptData.timesheet_data && currentDeptData.timesheet_data.length > 0),
+      hasUtilization: !!(currentDeptData.team_utilization && Object.keys(currentDeptData.team_utilization).length > 0)
+    });
+    
+    // Always apply department data if available, regardless of what's currently in state
+    if (currentDeptData.employees || currentDeptData.available_resources || currentDeptData.timesheet_data || currentDeptData.team_utilization) {
+      applyDepartmentData(currentDeptData);
+      console.log(`Applied department data for ${selectedDepartment}`);
+    }
+    
+    // Also ensure sales order hours data is populated if available
+    if (salesOrderHoursCache.cached && salesOrderHoursCache.data) {
+      setSalesOrderHoursData(salesOrderHoursCache.data);
+    }
+  }, [selectedDepartment, getDepartmentData, applyDepartmentData, salesOrderHoursCache]);
 
 
 
@@ -136,137 +194,83 @@ function App() {
     return `${hours}h ${minutes}m`;
   }, []);
 
-  useEffect(() => {
-    console.log(`useEffect triggered - selectedPeriod: ${selectedPeriod}, viewType: ${viewType}, selectedDepartment: ${selectedDepartment}`);
+  // Helper function to handle tab switching with proper loading states
+  const handleTabSwitch = useCallback((tabName) => {
+    const tabsNeedingMainData = ['employees', 'resources', 'timesheet', 'utilization'];
     
-    const fetchData = async () => {
-      const hasAnyData = (
-        employees.length > 0 ||
-        availableResources.length > 0 ||
-        timesheetData.length > 0 ||
-        Object.keys(teamUtilizationData).length > 0
-      );
-      if (!hasAnyData) {
-        setLoading(true);
+    // Always ensure data is populated for tabs that need main data
+    if (tabsNeedingMainData.includes(tabName)) {
+      // Get current department data and apply it
+      const currentDeptData = getDepartmentData(selectedDepartment);
+      if (currentDeptData.employees || currentDeptData.available_resources || currentDeptData.timesheet_data || currentDeptData.team_utilization) {
+        applyDepartmentData(currentDeptData);
       } else {
-        setIsRefreshing(true);
+        // Only set loading if we truly have no data for this department
+        const hasAnyDataForDept = Object.keys(allDepartmentsData).length > 0;
+        if (!hasAnyDataForDept) {
+          setLoading(true);
+        }
       }
-      setError(null);
-      setFetchProgress(0);
-      
+    }
+    
+    setActiveTab(tabName);
+  }, [selectedDepartment, getDepartmentData, applyDepartmentData, allDepartmentsData]);
+
+  useEffect(() => {
+    console.log(`Data effect - dept: ${selectedDepartment}, period: ${selectedPeriod}, view: ${viewType}`);
+    let canceled = false;
+    const cacheKey = buildDashboardCacheKey(selectedDepartment, selectedPeriod, viewType);
+    const cachedEntry = dashboardCache[cacheKey];
+    if (cachedEntry) {
+      console.log(`Using dashboard cache for key ${cacheKey}`);
+      applyDepartmentData(cachedEntry.data);
+      setCacheStatus({ cached: true, last_updated: cachedEntry.last_updated });
+      return () => { canceled = true; };
+    }
+
+    setLoading(true);
+    setError(null);
+    setFetchProgress(0);
+
+    const progressInterval = setInterval(() => {
+      setFetchProgress(prev => Math.min(prev + 10, 90));
+    }, 200);
+
+    const fetchData = async () => {
       try {
-        console.log(`Fetching data for ${selectedDepartment} department, period: ${selectedPeriod}, view type: ${viewType}`);
-        console.log(`API URL: /api/all-departments-data?period=${selectedPeriod}&view_type=${viewType}`);
-        
-        // Simulate progress updates for better UX
-        const progressInterval = setInterval(() => {
-          setFetchProgress(prev => Math.min(prev + 10, 90));
-        }, 200);
-        
-        // Use the new caching API to fetch all departments data
-        // Request full payload on initial load to ensure dashboard completeness
         const apiUrl = `/api/all-departments-data?period=${selectedPeriod}&view_type=${viewType}&selected_department=${encodeURIComponent(selectedDepartment)}&include=employees,team_utilization,available_resources,timesheet_data`;
-        console.log(`Making API request to: ${apiUrl}`);
-        console.log(`Request parameters - period: ${selectedPeriod}, view_type: ${viewType}`);
-        
+        console.log(`Fetching: ${apiUrl}`);
         const response = await axios.get(apiUrl);
-        
-        console.log(`API Response received:`);
-        console.log(`- Status: ${response.status}`);
-        console.log(`- Cached: ${response.data.cached}`);
-        console.log(`- View Type in response: ${response.data.view_type || 'not specified'}`);
-        console.log(`- Period in response: ${response.data.selected_period || 'not specified'}`);
-        
+        if (canceled) return;
         clearInterval(progressInterval);
         setFetchProgress(100);
-        
         if (response.data.error) {
           throw new Error(response.data.error);
         }
         
+        // Store all departments' data for tab switching
         const { creative, creative_strategy, instructional_design, cached, cache_timestamp } = response.data;
+        const allDeptsData = {};
+        if (creative) allDeptsData.creative = creative;
+        if (creative_strategy) allDeptsData.creative_strategy = creative_strategy;
+        if (instructional_design) allDeptsData.instructional_design = instructional_design;
         
-        console.log(`=== Data Processing Debug ===`);
-        console.log(`Creative data available: ${creative ? 'yes' : 'no'}`);
-        console.log(`Creative Strategy data available: ${creative_strategy ? 'yes' : 'no'}`);
-        console.log(`Instructional Design data available: ${instructional_design ? 'yes' : 'no'}`);
+        setAllDepartmentsData(allDeptsData);
         
-        if (creative) {
-          console.log(`Creative available_resources count: ${creative.available_resources ? creative.available_resources.length : 'undefined'}`);
-          console.log(`Creative employees count: ${creative.employees ? creative.employees.length : 'undefined'}`);
-        }
+        // Apply data for the currently selected department
+        const deptKey = selectedDepartment === 'Creative Strategy' ? 'creative_strategy' : (selectedDepartment === 'Instructional Design' ? 'instructional_design' : 'creative');
+        const deptData = allDeptsData[deptKey] || {};
+        applyDepartmentData(deptData);
         
-        if (creative_strategy) {
-          console.log(`Creative Strategy available_resources count: ${creative_strategy.available_resources ? creative_strategy.available_resources.length : 'undefined'}`);
-          console.log(`Creative Strategy employees count: ${creative_strategy.employees ? creative_strategy.employees.length : 'undefined'}`);
-        }
-        
-        if (instructional_design) {
-          console.log(`Instructional Design available_resources count: ${instructional_design.available_resources ? instructional_design.available_resources.length : 'undefined'}`);
-          console.log(`Instructional Design employees count: ${instructional_design.employees ? instructional_design.employees.length : 'undefined'}`);
-        }
-        
-        // Store all departments data for quick switching
-        setAllDepartmentsData({
-          creative,
-          creative_strategy,
-          instructional_design
-        });
-        
-        // Update current cache key
-        const newCacheKey = `${selectedPeriod}_${viewType}`;
-        setCurrentCacheKey(newCacheKey);
-        console.log(`Updated cache key to: ${newCacheKey}`);
-        
-        // Set data for the currently selected department
-        const currentDepartmentData = selectedDepartment === 'Creative Strategy' ? creative_strategy : selectedDepartment === 'Instructional Design' ? instructional_design : creative;
-        
-        console.log(`Current department: ${selectedDepartment}`);
-        console.log(`Using department data: ${currentDepartmentData ? 'yes' : 'no'}`);
-        
-        if (currentDepartmentData) {
-          const newEmployees = currentDepartmentData.employees || [];
-          const newTeamUtilization = currentDepartmentData.team_utilization || {};
-          // In lean include, these may be missing; keep old values until explicitly requested
-          const newTimesheetData = currentDepartmentData.timesheet_data !== undefined ? currentDepartmentData.timesheet_data : timesheetData;
-          const newAvailableResources = currentDepartmentData.available_resources !== undefined ? currentDepartmentData.available_resources : availableResources;
-          
-          console.log(`Setting new data:`);
-          console.log(`- Employees: ${newEmployees.length}`);
-          console.log(`- Team Utilization keys: ${Object.keys(newTeamUtilization).length}`);
-          console.log(`- Timesheet Data: ${newTimesheetData.length}`);
-          console.log(`- Available Resources: ${newAvailableResources.length}`);
-          
-          // Debug available resources specifically
-          if (newAvailableResources.length > 0) {
-            console.log(`Sample available resource:`, newAvailableResources[0]);
-            console.log(`Available resources base_available_hours:`, newAvailableResources.map(r => r.base_available_hours).slice(0, 5));
-          }
-          
-          setEmployees(newEmployees);
-          setTeamUtilizationData(newTeamUtilization);
-          setTimesheetData(newTimesheetData);
-          setAvailableResources(newAvailableResources);
-        } else {
-          console.log(`No department data available for ${selectedDepartment}`);
-        }
-        
-        // Update cache status
-         setCacheStatus({
-          cached,
-          last_updated: cache_timestamp
-        });
-        
-        // Log cache status
-        if (cached) {
-          console.log('Using cached data');
-        } else {
-          console.log('Fetched fresh data from Odoo');
-        }
-        
+        setCacheStatus({ cached: !!cached, last_updated: cache_timestamp });
+        setDashboardCache(prev => ({
+          ...prev,
+          [cacheKey]: { data: deptData, last_updated: Math.floor(Date.now() / 1000) }
+        }));
         setLoading(false);
         setIsRefreshing(false);
       } catch (err) {
+        clearInterval(progressInterval);
         console.error('Error fetching data:', err);
         setError(err.message);
         setLoading(false);
@@ -275,7 +279,23 @@ function App() {
     };
 
     fetchData();
-  }, [selectedPeriod, viewType, selectedDepartment]); // Depend on period, view type, and department
+    return () => { canceled = true; clearInterval(progressInterval); };
+  }, [selectedDepartment, selectedPeriod, viewType, buildDashboardCacheKey, dashboardCache, applyDepartmentData]);
+
+  // Pre-populate all tabs when allDepartmentsData changes
+  useEffect(() => {
+    if (Object.keys(allDepartmentsData).length > 0) {
+      prePopulateAllTabs();
+    }
+  }, [allDepartmentsData, prePopulateAllTabs]);
+
+  // Ensure tabs get populated when department changes
+  useEffect(() => {
+    if (Object.keys(allDepartmentsData).length > 0) {
+      console.log(`Department changed to ${selectedDepartment}, re-populating tabs`);
+      prePopulateAllTabs();
+    }
+  }, [selectedDepartment, allDepartmentsData, prePopulateAllTabs]);
 
   // Load shareholders list on mount
   useEffect(() => {
@@ -286,94 +306,198 @@ function App() {
     }).catch(() => {});
   }, []);
 
-  // Load external hours data when external-hours tab is active
+  // Load sold hours data for selected period/view when utilization tab is active
   useEffect(() => {
-    if (activeTab === 'external-hours') {
-      console.log('Fetching external hours data...');
+    if (activeTab === 'utilization') {
+      console.log('Fetching sold hours data for selected period/view...');
       setLoading(true);
-      
-      axios.get('/api/external-hours')
+      const url = `/api/external-hours?period=${selectedPeriod}&view_type=${viewType}`;
+      axios.get(url)
         .then(res => {
-          console.log('External hours response:', res.data);
+          console.log('Sold hours response:', res.data);
           if (res.data && res.data.success) {
-            setExternalHoursData(res.data.data);
+            const data = res.data.data;
+            setExternalHoursData(data);
+            setExternalHoursCache({
+              cached: true,
+              last_updated: Math.floor(Date.now() / 1000),
+              data
+            });
           } else if (res.data && res.data.error) {
             setError(res.data.error);
           }
         })
         .catch(err => {
-          console.error('Error fetching external hours data:', err);
-          setError(err.response?.data?.error || 'Failed to fetch external hours data');
+          console.error('Error fetching sold hours data:', err);
+          setError(err.response?.data?.error || 'Failed to fetch sold hours data');
         })
         .finally(() => {
           setLoading(false);
         });
     }
-  }, [activeTab]);
+  }, [activeTab, selectedPeriod, viewType]);
+
+  // Load external hours data when sales-order-hours tab is active
+  useEffect(() => {
+    if (activeTab === 'sales-order-hours') {
+      // Check if we have cached data
+      if (salesOrderHoursCache.cached && salesOrderHoursCache.data) {
+        console.log('Using cached sales order hours data');
+        setSalesOrderHoursData(salesOrderHoursCache.data);
+        return;
+      }
+
+      console.log('Fetching sales order hours data...');
+      setLoading(true);
+      
+      const url = `/api/sales-order-hours?period=${selectedPeriod}&view_type=${viewType}`;
+      axios.get(url)
+        .then(res => {
+          console.log('Sales order hours response:', res.data);
+          if (res.data && res.data.success) {
+            const data = res.data.data;
+            setSalesOrderHoursData(data);
+            
+            // Cache the data
+            setSalesOrderHoursCache({
+              cached: true,
+              last_updated: Math.floor(Date.now() / 1000), // Current timestamp in seconds
+              data: data
+            });
+          } else if (res.data && res.data.error) {
+            setError(res.data.error);
+          }
+        })
+        .catch(err => {
+          console.error('Error fetching sales order hours data:', err);
+          const errorMessage = err.response?.data?.error || 'Failed to fetch sales order hours data';
+          
+          // Check if it's a server unavailability issue
+          if (errorMessage.includes('503') || errorMessage.includes('SERVICE UNAVAILABLE') || errorMessage.includes('Authentication failed')) {
+            setError('External data service is temporarily unavailable. Please try again later.');
+          } else {
+            setError(errorMessage);
+          }
+        })
+        .finally(() => {
+          setLoading(false);
+        });
+    }
+  }, [activeTab, salesOrderHoursCache.cached, salesOrderHoursCache.data, selectedPeriod, viewType]);
+
+
+
+  const refreshSalesOrderHoursCache = async () => {
+    console.log('Refreshing sales order hours cache...');
+    try {
+      const response = await axios.get(`/api/sales-order-hours?period=${selectedPeriod}&view_type=${viewType}`);
+      console.log('Fresh sales order hours response:', response.data);
+      
+      if (response.data && response.data.success) {
+        const data = response.data.data;
+        setSalesOrderHoursData(data);
+        
+        // Update cache
+        setSalesOrderHoursCache({
+          cached: true,
+          last_updated: Math.floor(Date.now() / 1000),
+          data: data
+        });
+      } else if (response.data && response.data.error) {
+        throw new Error(response.data.error);
+      }
+    } catch (err) {
+      console.error('Error refreshing sales order hours cache:', err);
+      const errorMessage = err.response?.data?.error || err.message || 'Failed to refresh sales order hours data';
+      
+      // Check if it's a server unavailability issue
+      if (errorMessage.includes('503') || errorMessage.includes('SERVICE UNAVAILABLE') || errorMessage.includes('Authentication failed')) {
+        throw new Error('External data service is temporarily unavailable. Please try again later.');
+      } else {
+        throw err;
+      }
+    }
+  };
+
 
   const handleRefresh = async () => {
     setIsRefreshing(true);
     setError(null);
     
     try {
-      console.log('Manually refreshing cache...');
-      console.log(`Refresh parameters - period: ${selectedPeriod}, view_type: ${viewType}`);
-      
-      // Call the cache refresh API
-      const refreshPayload = {
-        period: selectedPeriod,
-        view_type: viewType
-      };
-      console.log(`Sending refresh payload:`, refreshPayload);
-      
-      const response = await axios.post('/api/refresh-cache', refreshPayload);
-      
-      if (response.data.error) {
-        throw new Error(response.data.error);
+      if (activeTab === 'sales-order-hours') {
+        // Refresh sales order hours cache
+        await refreshSalesOrderHoursCache();
+        console.log('Sales order hours cache refreshed successfully');
+      } else {
+        // Refresh main dashboard cache
+        console.log('Manually refreshing cache...');
+        console.log(`Refresh parameters - period: ${selectedPeriod}, view_type: ${viewType}`);
+        
+        // Call the cache refresh API
+        const refreshPayload = {
+          period: selectedPeriod,
+          view_type: viewType
+        };
+        console.log(`Sending refresh payload:`, refreshPayload);
+        
+        const response = await axios.post('/api/refresh-cache', refreshPayload);
+        
+        if (response.data.error) {
+          throw new Error(response.data.error);
+        }
+        
+        // Fetch fresh data after cache refresh
+        // Request full payload after refresh
+        const dataApiUrl = `/api/all-departments-data?period=${selectedPeriod}&view_type=${viewType}&selected_department=${encodeURIComponent(selectedDepartment)}&include=employees,team_utilization,available_resources,timesheet_data`;
+        console.log(`Fetching fresh data from: ${dataApiUrl}`);
+        
+        const dataResponse = await axios.get(dataApiUrl);
+        
+        console.log(`Fresh data response:`);
+        console.log(`- Status: ${dataResponse.status}`);
+        console.log(`- Cached: ${dataResponse.data.cached}`);
+        console.log(`- View Type: ${dataResponse.data.view_type || 'not specified'}`);
+        console.log(`- Period: ${dataResponse.data.selected_period || 'not specified'}`);
+        
+        if (dataResponse.data.error) {
+          throw new Error(dataResponse.data.error);
+        }
+        
+        const { creative, creative_strategy, instructional_design, cached, cache_timestamp } = dataResponse.data;
+        
+        // Only store and process data for departments that were actually returned
+        const departmentsData = {};
+        if (creative) departmentsData.creative = creative;
+        if (creative_strategy) departmentsData.creative_strategy = creative_strategy;
+        if (instructional_design) departmentsData.instructional_design = instructional_design;
+        
+        // Update departments data with only what was returned
+        setAllDepartmentsData(departmentsData);
+        
+        // Update current department data and cache
+        const deptKeyName = selectedDepartment === 'Creative Strategy' ? 'creative_strategy' : (selectedDepartment === 'Instructional Design' ? 'instructional_design' : 'creative');
+        const currentDepartmentData = departmentsData[deptKeyName] || {};
+        if (currentDepartmentData) {
+          setEmployees(currentDepartmentData.employees || []);
+          setTeamUtilizationData(currentDepartmentData.team_utilization || {});
+          setTimesheetData(currentDepartmentData.timesheet_data || []);
+          setAvailableResources(currentDepartmentData.available_resources || []);
+          const cacheKey = buildDashboardCacheKey(selectedDepartment, selectedPeriod, viewType);
+          setDashboardCache(prev => ({
+            ...prev,
+            [cacheKey]: { data: currentDepartmentData, last_updated: Math.floor(Date.now() / 1000) }
+          }));
+        }
+        
+        // Update cache status
+        setCacheStatus({
+          cached,
+          last_updated: cache_timestamp
+        });
+        
+        console.log('Cache refreshed successfully');
       }
-      
-      // Fetch fresh data after cache refresh
-      // Request full payload after refresh
-      const dataApiUrl = `/api/all-departments-data?period=${selectedPeriod}&view_type=${viewType}&selected_department=${encodeURIComponent(selectedDepartment)}&include=employees,team_utilization,available_resources,timesheet_data`;
-      console.log(`Fetching fresh data from: ${dataApiUrl}`);
-      
-      const dataResponse = await axios.get(dataApiUrl);
-      
-      console.log(`Fresh data response:`);
-      console.log(`- Status: ${dataResponse.status}`);
-      console.log(`- Cached: ${dataResponse.data.cached}`);
-      console.log(`- View Type: ${dataResponse.data.view_type || 'not specified'}`);
-      console.log(`- Period: ${dataResponse.data.selected_period || 'not specified'}`);
-      
-      if (dataResponse.data.error) {
-        throw new Error(dataResponse.data.error);
-      }
-      
-      const { creative, creative_strategy, cached, cache_timestamp } = dataResponse.data;
-      
-      // Update all departments data
-      setAllDepartmentsData({
-        creative,
-        creative_strategy
-      });
-      
-      // Update current department data
-      const currentDepartmentData = selectedDepartment === 'Creative Strategy' ? creative_strategy : selectedDepartment === 'Instructional Design' ? allDepartmentsData.instructional_design : creative;
-      
-      if (currentDepartmentData) {
-        setEmployees(currentDepartmentData.employees || []);
-        setTeamUtilizationData(currentDepartmentData.team_utilization || {});
-        setTimesheetData(currentDepartmentData.timesheet_data || []);
-        setAvailableResources(currentDepartmentData.available_resources || []);
-      }
-      
-      // Update cache status
-      setCacheStatus({
-        cached,
-        last_updated: cache_timestamp
-      });
-      
-      console.log('Cache refreshed successfully');
       
     } catch (err) {
       console.error('Error refreshing cache:', err);
@@ -385,37 +509,26 @@ function App() {
 
   const handleDepartmentChange = (department) => {
     console.log(`Switching department to: ${department}`);
-    setSelectedDepartment(department);
-    
-    // Only use cached data if we have data for the current view type and period
-            const departmentData = allDepartmentsData[department === 'Creative Strategy' ? 'creative_strategy' : department === 'Instructional Design' ? 'instructional_design' : 'creative'];
-    const expectedCacheKey = `${selectedPeriod}_${viewType}`;
-    
-    if (departmentData && Object.keys(allDepartmentsData).length > 0 && currentCacheKey === expectedCacheKey) {
-      console.log(`Using cached data for department switch (cache key matches: ${currentCacheKey})`);
-      setEmployees(departmentData.employees || []);
-      setTeamUtilizationData(departmentData.team_utilization || {});
-      setTimesheetData(departmentData.timesheet_data || []);
-      setAvailableResources(departmentData.available_resources || []);
+    const cacheKey = buildDashboardCacheKey(department, selectedPeriod, viewType);
+    const cachedEntry = dashboardCache[cacheKey];
+    if (cachedEntry) {
+      console.log(`Using cached dashboard data for ${cacheKey}`);
+      applyDepartmentData(cachedEntry.data);
+      setCacheStatus({ cached: true, last_updated: cachedEntry.last_updated });
     } else {
-      console.log(`No valid cached data available (cache key mismatch or no data), will fetch fresh data`);
-      console.log(`Current cache key: ${currentCacheKey}, Expected: ${expectedCacheKey}`);
-      // Keep current data visible while fetching; use soft refresh indicator
-      setIsRefreshing(true);
+      // Check if we have data for this department in allDepartmentsData
+      const deptKey = department === 'Creative Strategy' ? 'creative_strategy' : 
+                     (department === 'Instructional Design' ? 'instructional_design' : 'creative');
+      const deptData = allDepartmentsData[deptKey];
+      if (deptData) {
+        console.log(`Using existing department data for ${department}`);
+        applyDepartmentData(deptData);
+      } else {
+        setIsRefreshing(true);
+      }
     }
 
-    // Ensure we fetch full payload when switching department so view is complete
-    const fullUrl = `/api/all-departments-data?period=${selectedPeriod}&view_type=${viewType}&selected_department=${encodeURIComponent(department)}&include=employees,team_utilization,available_resources,timesheet_data`;
-    axios.get(fullUrl).then(res => {
-      const data = res.data[department === 'Creative Strategy' ? 'creative_strategy' : department === 'Instructional Design' ? 'instructional_design' : 'creative'] || {};
-      setEmployees(data.employees || []);
-      setTeamUtilizationData(data.team_utilization || {});
-      setAvailableResources(data.available_resources || []);
-      setTimesheetData(data.timesheet_data || []);
-      setIsRefreshing(false);
-    }).catch(() => {}).finally(() => {});
-    
-    // Reset filters when switching departments
+    setSelectedDepartment(department);
     setSelectedPoolFilters([]);
     setSelectedResourcePoolFilter(null);
   };
@@ -432,25 +545,67 @@ function App() {
     } else {
       setSelectedPeriod(newPeriod);
     }
+    const cacheKey = buildDashboardCacheKey(selectedDepartment, newPeriod, viewType);
+    const cachedEntry = dashboardCache[cacheKey];
+    if (cachedEntry) {
+      applyDepartmentData(cachedEntry.data);
+      setCacheStatus({ cached: true, last_updated: cachedEntry.last_updated });
+    } else {
+      setIsRefreshing(true);
+    }
     
-    // Force a fresh data fetch but keep current data visible
-    setAllDepartmentsData({});
-    setCurrentCacheKey(''); // Clear cache key to force fresh data fetch
-    setIsRefreshing(true);
+    // Clear external hours data and cache when period changes
+    setExternalHoursData({
+      ksa: { totalHours: 0, contracts: [], orders: [] },
+      uae: { totalHours: 0, contracts: [], orders: [] }
+    });
+    setExternalHoursCache({
+      cached: false,
+      last_updated: null,
+      data: {}
+    });
     
-    // Note: Removed auto-refresh to prevent conflicts with useEffect
-    // The useEffect will handle data fetching automatically when state updates
+    // Clear sales order hours data and cache when period changes
+    setSalesOrderHoursData({
+      ksa: { totalHours: 0, orders: [] },
+      uae: { totalHours: 0, orders: [] }
+    });
+    setSalesOrderHoursCache({
+      cached: false,
+      last_updated: null,
+      data: {}
+    });
+    
+    // The main effect will handle fetching if needed
   };
 
   const handleViewTypeChange = (newViewType) => {
     console.log(`Switching to ${newViewType} view`);
     console.log(`Current viewType: ${viewType}, newViewType: ${newViewType}`);
     
-    // Reset period to first option of the new view type
-    // Force a fresh data fetch but keep current data visible
-    setAllDepartmentsData({});
-    setCurrentCacheKey(''); // Clear cache key to force fresh data fetch
     setIsRefreshing(true);
+    
+    // Clear external hours data and cache when view type changes
+    setExternalHoursData({
+      ksa: { totalHours: 0, contracts: [], orders: [] },
+      uae: { totalHours: 0, contracts: [], orders: [] }
+    });
+    setExternalHoursCache({
+      cached: false,
+      last_updated: null,
+      data: {}
+    });
+    
+    // Clear sales order hours data and cache when view type changes
+    setSalesOrderHoursData({
+      ksa: { totalHours: 0, orders: [] },
+      uae: { totalHours: 0, orders: [] }
+    });
+    setSalesOrderHoursCache({
+      cached: false,
+      last_updated: null,
+      data: {}
+    });
     
     // Update both state values at the same time to trigger useEffect
     setViewType(newViewType);
@@ -458,8 +613,7 @@ function App() {
     setSelectedPeriod('2025-01'); // Default to first month
     console.log('State update calls completed');
     
-    // Note: Removed auto-refresh to prevent conflicts with useEffect
-    // The useEffect will handle data fetching automatically when state updates
+    // The main effect will handle fetching or serving from cache
   };
 
   const handlePoolFilterClick = (poolName) => {
@@ -655,6 +809,16 @@ function App() {
     return (
     <div className="app">
       <div className="container">
+        {/* Loading Overlay */}
+        {loading && (
+          <div className="loading-overlay">
+            <div className="loading-content">
+              <div className="loading-spinner">⏳</div>
+              <p>Loading dashboard data...</p>
+            </div>
+          </div>
+        )}
+        
         <header className="header">
           <h1>🎨 {selectedDepartment} Department</h1>
           <p>{selectedDepartment} Department Dashboard</p>
@@ -688,38 +852,39 @@ function App() {
         <div className="tab-navigation">
           <button 
             className={`tab-btn ${activeTab === 'employees' ? 'active' : ''}`}
-            onClick={() => setActiveTab('employees')}
+            onClick={() => handleTabSwitch('employees')}
           >
             👥 Number of {selectedDepartment === 'Creative Strategy' || selectedDepartment === 'Instructional Design' ? 'Team Members' : 'Creatives'} ({employees.length})
           </button>
             <button 
             className={`tab-btn ${activeTab === 'resources' ? 'active' : ''}`}
-            onClick={() => setActiveTab('resources')}
+            onClick={() => handleTabSwitch('resources')}
           >
             📊 Available {selectedDepartment === 'Creative Strategy' || selectedDepartment === 'Instructional Design' ? 'Team Members' : 'Creatives'} ({availableResources.length})
           </button>
             <button 
             className={`tab-btn ${activeTab === 'timesheet' ? 'active' : ''}`}
-            onClick={() => setActiveTab('timesheet')}
+            onClick={() => handleTabSwitch('timesheet')}
           >
             ⏱️ Active {selectedDepartment === 'Creative Strategy' || selectedDepartment === 'Instructional Design' ? 'Team Members' : 'Creatives'} ({activeTimesheetCount})
           </button>
+
           <button 
-            className={`tab-btn ${activeTab === 'external-hours' ? 'active' : ''}`}
-            onClick={() => setActiveTab('external-hours')}
+            className={`tab-btn ${activeTab === 'sales-order-hours' ? 'active' : ''}`}
+            onClick={() => handleTabSwitch('sales-order-hours')}
           >
-            🌐 External Hours
+            📋 External Hours
           </button>
           <button 
             className={`tab-btn ${activeTab === 'utilization' ? 'active' : ''}`}
-            onClick={() => setActiveTab('utilization')}
+            onClick={() => handleTabSwitch('utilization')}
           >
             📈 Utilization Dashboard
           </button>
         </div>
 
-        {/* View Type and Period Selector for Resources, Timesheet, External Hours, and Utilization Tabs */}
-        {(activeTab === 'resources' || activeTab === 'timesheet' || activeTab === 'external-hours' || activeTab === 'utilization') && (
+        {/* View Type and Period Selector for Resources, Timesheet, Sales Order Hours, and Utilization Tabs */}
+        {(activeTab === 'resources' || activeTab === 'timesheet' || activeTab === 'sales-order-hours' || activeTab === 'utilization') && (
           <div className="view-selector">
             <div className="view-type-selector">
               <label htmlFor="view-type-select">View Type:</label>
@@ -1182,64 +1347,74 @@ function App() {
           </div>
         )}
 
-        {activeTab === 'external-hours' && (
+
+
+        {activeTab === 'sales-order-hours' && (
           <div className="tab-content">
             <div className="external-hours-dashboard">
               <h2>External Hours Dashboard</h2>
-              <p>Calculate external hours for KSA and UAE pools based on retainer contracts with 'In Progress' subscription status.</p>
+              <p>Calculate external hours from sales orders (adhoc, framework, and strategy) after July 1st for KSA and UAE markets.</p>
+              {salesOrderHoursData.source && (
+                <div className="data-source-indicator">
+                  <span className={`source-badge ${salesOrderHoursData.source}`}>
+                    📊 Data Source: {salesOrderHoursData.source === 'google_sheets' ? 'Google Sheets' : 'Odoo'}
+                  </span>
+                </div>
+              )}
               
               <div className="external-hours-stats">
                 <div className="pool-stats">
                   <div className="pool-stat-card">
-                    <h3>🇸🇦 KSA Pool</h3>
-                    <div className="stat-number">{formatDecimalHours(externalHoursData.ksa.totalHours)}</div>
+                    <h3>KSA Pool</h3>
+                    <div className="stat-number">{formatDecimalHours(salesOrderHoursData.ksa.totalHours)}</div>
                     <div className="stat-label">Total External Hours</div>
-                    <div className="contracts-count">{externalHoursData.ksa.contracts.length} Active Contracts</div>
+                    <div className="orders-count">{salesOrderHoursData.ksa.orders?.length || 0} Customers</div>
                   </div>
                   
                   <div className="pool-stat-card">
-                    <h3>🇦🇪 UAE Pool</h3>
-                    <div className="stat-number">{formatDecimalHours(externalHoursData.uae.totalHours)}</div>
+                    <h3>UAE Pool</h3>
+                    <div className="stat-number">{formatDecimalHours(salesOrderHoursData.uae.totalHours)}</div>
                     <div className="stat-label">Total External Hours</div>
-                    <div className="contracts-count">{externalHoursData.uae.contracts.length} Active Contracts</div>
+                    <div className="orders-count">{salesOrderHoursData.uae.orders?.length || 0} Customers</div>
                   </div>
                   
                   <div className="pool-stat-card total-stat">
                     <h3>📊 Total</h3>
                     <div className="stat-number">
-                      {formatDecimalHours(externalHoursData.ksa.totalHours + externalHoursData.uae.totalHours)}
+                      {formatDecimalHours(salesOrderHoursData.ksa.totalHours + salesOrderHoursData.uae.totalHours)}
                     </div>
                     <div className="stat-label">Combined External Hours</div>
-                    <div className="contracts-count">
-                      {externalHoursData.ksa.contracts.length + externalHoursData.uae.contracts.length} Total Contracts
+                    <div className="orders-count">
+                      {(salesOrderHoursData.ksa.orders?.length || 0) + (salesOrderHoursData.uae.orders?.length || 0)} Total Customers
                     </div>
                   </div>
                 </div>
                 
-                <div className="contracts-details">
-                  <h3>Contract Details</h3>
-                  <div className="contracts-grid">
-                    {/* KSA Contracts */}
-                    <div className="contracts-section">
-                      <h4>🇸🇦 KSA Contracts ({externalHoursData.ksa.contracts.length})</h4>
-                      {externalHoursData.ksa.contracts.length === 0 ? (
-                        <div className="no-contracts">No KSA contracts found with 'In Progress' status</div>
+                <div className="orders-details">
+                  <h3>Customer Sales Order Details</h3>
+                  <div className="orders-grid">
+                    {/* KSA Orders */}
+                    <div className="orders-section">
+                      <h4>🇸🇦 KSA Customers ({salesOrderHoursData.ksa.orders?.length || 0})</h4>
+                      {(salesOrderHoursData.ksa.orders?.length || 0) === 0 ? (
+                        <div className="no-orders">No KSA customers found with sales orders after July 1st</div>
                       ) : (
-                        <div className="contracts-list">
-                          {externalHoursData.ksa.contracts.map((contract, index) => (
-                            <div key={index} className="contract-card">
-                              <div className="contract-header">
-                                <h5>{contract.partner_name}</h5>
-                                <span className="contract-status">{contract.subscription_status}</span>
+                        <div className="orders-list">
+                          {salesOrderHoursData.ksa.orders?.map((customer, index) => (
+                            <div key={index} className="customer-card">
+                              <div className="customer-header">
+                                <h5>{customer.customer_name}</h5>
+                                <span className="customer-total-hours">{formatDecimalHours(customer.total_hours || 0)} hours</span>
                               </div>
-                              <div className="contract-details">
-                                <div className="contract-hours">
-                                  <span className="hours-label">External Hours:</span>
-                                  <span className="hours-value">{formatDecimalHours(contract.external_hours || 0)}</span>
-                                </div>
-                                <div className="contract-market">
-                                  <span className="market-label">Market:</span>
-                                  <span className="market-value">{contract.market}</span>
+                              <div className="customer-orders">
+                                <span className="orders-count">{customer.orders?.length || 0} orders</span>
+                                <div className="orders-summary">
+                                  {customer.orders?.map((order, orderIndex) => (
+                                    <div key={orderIndex} className="order-summary">
+                                      <span className="order-name">{order.order_name}</span>
+                                      <span className="order-hours">{formatDecimalHours(order.total_hours || 0)}h</span>
+                                    </div>
+                                  ))}
                                 </div>
                               </div>
                             </div>
@@ -1248,27 +1423,28 @@ function App() {
                       )}
                     </div>
                     
-                    {/* UAE Contracts */}
-                    <div className="contracts-section">
-                      <h4>🇦🇪 UAE Contracts ({externalHoursData.uae.contracts.length})</h4>
-                      {externalHoursData.uae.contracts.length === 0 ? (
-                        <div className="no-contracts">No UAE contracts found with 'In Progress' status</div>
+                    {/* UAE Orders */}
+                    <div className="orders-section">
+                      <h4>🇦🇪 UAE Customers ({salesOrderHoursData.uae.orders?.length || 0})</h4>
+                      {(salesOrderHoursData.uae.orders?.length || 0) === 0 ? (
+                        <div className="no-orders">No UAE customers found with sales orders after July 1st</div>
                       ) : (
-                        <div className="contracts-list">
-                          {externalHoursData.uae.contracts.map((contract, index) => (
-                            <div key={index} className="contract-card">
-                              <div className="contract-header">
-                                <h5>{contract.partner_name}</h5>
-                                <span className="contract-status">{contract.subscription_status}</span>
+                        <div className="orders-list">
+                          {salesOrderHoursData.uae.orders?.map((customer, index) => (
+                            <div key={index} className="customer-card">
+                              <div className="customer-header">
+                                <h5>{customer.customer_name}</h5>
+                                <span className="customer-total-hours">{formatDecimalHours(customer.total_hours || 0)} hours</span>
                               </div>
-                              <div className="contract-details">
-                                <div className="contract-hours">
-                                  <span className="hours-label">External Hours:</span>
-                                  <span className="hours-value">{formatDecimalHours(contract.external_hours || 0)}</span>
-                                </div>
-                                <div className="contract-market">
-                                  <span className="market-label">Market:</span>
-                                  <span className="market-value">{contract.market}</span>
+                              <div className="customer-orders">
+                                <span className="orders-count">{customer.orders?.length || 0} orders</span>
+                                <div className="orders-summary">
+                                  {customer.orders?.map((order, orderIndex) => (
+                                    <div key={orderIndex} className="order-summary">
+                                      <span className="order-name">{order.order_name}</span>
+                                      <span className="order-hours">{formatDecimalHours(order.total_hours || 0)}h</span>
+                                    </div>
+                                  ))}
                                 </div>
                               </div>
                             </div>
@@ -1379,6 +1555,42 @@ function App() {
                               {teamData.variance >= 0 ? '+' : ''}{(teamData.variance || 0).toFixed(1)}%
                             </span>
                           </div>
+                          <div className="stat-row">
+                            <span className="stat-label">Efficiency Ratio:</span>
+                            <span className="stat-value">
+                              {(() => {
+                                const loggedHours = teamData.logged_hours || 0;
+                                const externalHours = (externalHoursData.ksa.totalHours || 0) + (externalHoursData.uae.totalHours || 0);
+                                if (externalHours === 0) return 'N/A';
+                                const ratio = (loggedHours / externalHours) * 100;
+                                return `${ratio.toFixed(1)}%`;
+                              })()}
+                            </span>
+                          </div>
+                          <div className="stat-row">
+                            <span className="stat-label">Billable Utilization:</span>
+                            <span className="stat-value">
+                              {(() => {
+                                const externalHours = (externalHoursData.ksa.totalHours || 0) + (externalHoursData.uae.totalHours || 0);
+                                const availableHours = teamData.available_hours || 0;
+                                if (availableHours === 0) return 'N/A';
+                                const billableUtilization = (externalHours / availableHours) * 100;
+                                return `${billableUtilization.toFixed(1)}%`;
+                              })()}
+                            </span>
+                          </div>
+                          <div className="stat-row">
+                            <span className="stat-label">Scope Health:</span>
+                            <span className="stat-value">
+                              {(() => {
+                                const externalHours = (externalHoursData.ksa.totalHours || 0) + (externalHoursData.uae.totalHours || 0);
+                                const plannedHours = teamData.planned_hours || 0;
+                                if (plannedHours === 0) return 'N/A';
+                                const scopeHealth = (externalHours / plannedHours) * 100;
+                                return `${scopeHealth.toFixed(1)}%`;
+                              })()}
+                            </span>
+                          </div>
                         </div>
                       </div>
                     );
@@ -1463,6 +1675,79 @@ function App() {
                                                           {teamData.variance >= 0 ? '+' : ''}{(teamData.variance || 0).toFixed(1)}%
                           </span>
                         </div>
+                        {teamName.toLowerCase() !== 'nightshift' && (
+                          <>
+                            <div className="stat-row">
+                              <span className="stat-label">Efficiency Ratio:</span>
+                              <span className="stat-value">
+                                {(() => {
+                                  const loggedHours = teamData.logged_hours || 0;
+                                  let externalHours = 0;
+                                  
+                                  // Map team name to corresponding external hours pool
+                                  if (teamName.toLowerCase().includes('ksa')) {
+                                    externalHours = externalHoursData.ksa.totalHours || 0;
+                                  } else if (teamName.toLowerCase().includes('uae')) {
+                                    externalHours = externalHoursData.uae.totalHours || 0;
+                                  } else {
+                                    // For teams that don't map directly, use combined total
+                                    externalHours = (externalHoursData.ksa.totalHours || 0) + (externalHoursData.uae.totalHours || 0);
+                                  }
+                                  
+                                  if (externalHours === 0) return 'N/A';
+                                  const ratio = (loggedHours / externalHours) * 100;
+                                  return `${ratio.toFixed(1)}%`;
+                                })()}
+                              </span>
+                            </div>
+                            <div className="stat-row">
+                              <span className="stat-label">Billable Utilization:</span>
+                              <span className="stat-value">
+                                {(() => {
+                                  let externalHours = 0;
+                                  
+                                  // Map team name to corresponding external hours pool
+                                  if (teamName.toLowerCase().includes('ksa')) {
+                                    externalHours = externalHoursData.ksa.totalHours || 0;
+                                  } else if (teamName.toLowerCase().includes('uae')) {
+                                    externalHours = externalHoursData.uae.totalHours || 0;
+                                  } else {
+                                    // For teams that don't map directly, use combined total
+                                    externalHours = (externalHoursData.ksa.totalHours || 0) + (externalHoursData.uae.totalHours || 0);
+                                  }
+                                  
+                                  const availableHours = teamData.available_hours || 0;
+                                  if (availableHours === 0) return 'N/A';
+                                  const billableUtilization = (externalHours / availableHours) * 100;
+                                  return `${billableUtilization.toFixed(1)}%`;
+                                })()}
+                              </span>
+                            </div>
+                            <div className="stat-row">
+                              <span className="stat-label">Scope Health:</span>
+                              <span className="stat-value">
+                                {(() => {
+                                  let externalHours = 0;
+                                  
+                                  // Map team name to corresponding external hours pool
+                                  if (teamName.toLowerCase().includes('ksa')) {
+                                    externalHours = externalHoursData.ksa.totalHours || 0;
+                                  } else if (teamName.toLowerCase().includes('uae')) {
+                                    externalHours = externalHoursData.uae.totalHours || 0;
+                                  } else {
+                                    // For teams that don't map directly, use combined total
+                                    externalHours = (externalHoursData.ksa.totalHours || 0) + (externalHoursData.uae.totalHours || 0);
+                                  }
+                                  
+                                  const plannedHours = teamData.planned_hours || 0;
+                                  if (plannedHours === 0) return 'N/A';
+                                  const scopeHealth = (externalHours / plannedHours) * 100;
+                                  return `${scopeHealth.toFixed(1)}%`;
+                                })()}
+                              </span>
+                            </div>
+                          </>
+                        )}
                       </div>
                     </div>
                   ))
@@ -1478,7 +1763,7 @@ function App() {
               {/* Shareholder Updates Management */}
               <div className="shareholder-section">
                 <h3>Shareholder Updates</h3>
-                <p className="shareholder-subtext">Send weekly utilization summaries (weekly view) to saved emails.</p>
+                <p className="shareholder-subtext">Send comprehensive monthly utilization reports with full dashboard data to saved emails.</p>
                 <div className="shareholder-controls">
                   <input 
                     type="email"
@@ -1511,7 +1796,7 @@ function App() {
                         }
                       } catch (_) {}
                     }}
-                  >Preview</button>
+                  >Preview Weekly Report</button>
                   <button 
                     className={`shareholder-btn send ${isSending ? 'disabled' : ''}`}
                     disabled={isSending}
@@ -1522,7 +1807,7 @@ function App() {
                       } catch (_) {}
                       setIsSending(false);
                     }}
-                  >{isSending ? 'Sending...' : 'Send Weekly Now'}</button>
+                  >{isSending ? 'Sending...' : 'Send Weekly Report'}</button>
                 </div>
                 
                 <div className="shareholder-list">
@@ -1540,7 +1825,7 @@ function App() {
                                 await axios.post('/api/shareholders/send-test', { email });
                               } catch (_) {}
                             }}
-                          >Send Test</button>
+                          >Send Test Weekly</button>
                           <button 
                             className="shareholder-btn remove"
                             onClick={async () => {
@@ -1690,14 +1975,17 @@ function App() {
           </div>
         )}
       </div>
-      {cacheStatus.last_updated && (
+      {((activeTab === 'sales-order-hours' && salesOrderHoursCache.last_updated) || (activeTab !== 'sales-order-hours' && cacheStatus.last_updated)) && (
         <div className="unified-cache-refresh">
           <div className="cache-status-section">
             <span className="cache-indicator">
-              {cacheStatus.cached ? '📦 Cached' : '🔄 Fresh'}
+              {activeTab === 'sales-order-hours'
+                ? (salesOrderHoursCache.cached ? '📦 Cached' : '🔄 Fresh')
+                : (cacheStatus.cached ? '📦 Cached' : '🔄 Fresh')
+              }
             </span>
             <span className="cache-time">
-              Last updated: {new Date(cacheStatus.last_updated * 1000).toLocaleTimeString()}
+              Last updated: {new Date((activeTab === 'sales-order-hours' ? salesOrderHoursCache.last_updated : cacheStatus.last_updated) * 1000).toLocaleTimeString()}
             </span>
           </div>
           <button 

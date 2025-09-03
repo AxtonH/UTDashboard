@@ -6,7 +6,12 @@
       "Bash(python:*)",
       "Bash(npm start)",
       "Bash(set PORT=3000)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(curl:*)",
+      "Bash(/dev/null)",
+      "Bash(timeout 10 npm start)",
+      "Bash(timeout:*)",
+      "Bash(cp:*)"
     ],
     "deny": [],
     "ask": []
