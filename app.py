@@ -16,6 +16,7 @@ import re
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+import requests
 
 # Google Sheets API imports
 from google.oauth2 import service_account
@@ -448,6 +449,104 @@ def clear_cache():
         department_cache['creative_strategy'] = {}
         department_cache['cache_timestamps'] = {}
 
+# Currency conversion utilities for scorecard revenue only
+_exchange_rates_cache = {}
+_exchange_rates_timestamp = 0
+EXCHANGE_RATES_CACHE_TTL = 3600  # 1 hour in seconds
+
+def get_exchange_rates():
+    """
+    Fetch current exchange rates with AED as base currency.
+    Uses free exchangerate-api.com service with caching.
+    """
+    global _exchange_rates_cache, _exchange_rates_timestamp
+    
+    current_time = time.time()
+    
+    # Check if cache is still valid
+    if (_exchange_rates_cache and 
+        current_time - _exchange_rates_timestamp < EXCHANGE_RATES_CACHE_TTL):
+        return _exchange_rates_cache
+    
+    try:
+        # Using free exchangerate-api.com with AED as base currency
+        response = requests.get(
+            'https://api.exchangerate-api.com/v4/latest/AED',
+            timeout=10
+        )
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if 'rates' in data:
+            # Convert rates to "to AED" format (inverse of from AED)
+            rates_to_aed = {}
+            for currency, rate_from_aed in data['rates'].items():
+                rates_to_aed[currency] = 1 / rate_from_aed if rate_from_aed != 0 else 0
+            
+            # AED to AED is always 1
+            rates_to_aed['AED'] = 1.0
+            
+            _exchange_rates_cache = rates_to_aed
+            _exchange_rates_timestamp = current_time
+            
+            print(f"Updated exchange rates for scorecard: {len(rates_to_aed)} currencies")
+            return rates_to_aed
+        else:
+            print("Invalid response format from exchange rate API")
+            return _get_fallback_rates()
+            
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching exchange rates: {e}")
+        return _get_fallback_rates()
+    except Exception as e:
+        print(f"Unexpected error in get_exchange_rates: {e}")
+        return _get_fallback_rates()
+
+def _get_fallback_rates():
+    """Fallback exchange rates if API is unavailable"""
+    return {
+        'USD': 3.67,    # 1 USD = 3.67 AED (approximate)
+        'EUR': 4.00,    # 1 EUR = 4.00 AED (approximate)
+        'SAR': 0.98,    # 1 SAR = 0.98 AED (approximate)
+        'AED': 1.0,     # 1 AED = 1 AED
+        'GBP': 4.60,    # 1 GBP = 4.60 AED (approximate)
+    }
+
+def convert_to_aed(amount, currency_code):
+    """
+    Convert an amount from given currency to AED.
+    
+    Args:
+        amount: The amount to convert
+        currency_code: The source currency code (USD, EUR, SAR, etc.)
+    
+    Returns:
+        Converted amount in AED
+    """
+    if not amount or amount == 0:
+        return 0
+    
+    if not currency_code or currency_code == 'AED':
+        return amount
+    
+    rates = get_exchange_rates()
+    conversion_rate = rates.get(currency_code.upper())
+    
+    if conversion_rate:
+        return amount * conversion_rate
+    else:
+        print(f"Warning: No exchange rate found for {currency_code}, using fallback rate")
+        # Use fallback rates if API fails
+        fallback_rates = {
+            'USD': 3.67,
+            'EUR': 4.00,
+            'SAR': 0.98,
+            'GBP': 4.60
+        }
+        fallback_rate = fallback_rates.get(currency_code.upper(), 1.0)
+        return amount * fallback_rate
+
 def get_connection_status():
     """Get connection pool status information."""
     with _odoo_connection_pool['lock']:
@@ -767,7 +866,6 @@ def fetch_department_data_parallel(department_name, period=None, view_type='mont
     except Exception as e:
         print(f"Error in parallel fetch for {department_name}: {e}")
         return None
-
 def fetch_department_data_sequential(department_name, period=None, view_type='monthly'):
     """
     Fetch department data sequentially as a reliable fallback.
@@ -1505,7 +1603,6 @@ def _get_last_month_period():
     else:
         last_month = datetime.date(today.year, today.month - 1, 1)
     return last_month.strftime('%Y-%m')
-
 def get_dashboard_data(period=None, view_type='monthly'):
     """
     Get comprehensive dashboard data for all departments.
@@ -2300,7 +2397,6 @@ def get_public_holidays(models, uid, start_date, end_date, company_id=None):
     except Exception as e:
         print(f"Error fetching public holidays: {e}")
         return []
-
 def calculate_holiday_hours_in_period(holidays, start_date, end_date, view_type='monthly', working_weekdays: set = None):
     """
     Calculate total holiday hours that fall within the specified period.
@@ -2653,7 +2749,10 @@ def get_creative_employees():
                                             'name', 
                                             'job_title', 
                                             'work_email',
-                                            'category_ids'  # This is the many2many field for categories/tags
+                                            'category_ids',  # This is the many2many field for categories/tags
+                                            'active',  # Employee active status
+                                            'work_permit_expiration_date',  # Could indicate availability
+                                            'employee_type'  # Could indicate availability status
                                         ]
                                     })
         
@@ -2690,11 +2789,31 @@ def get_creative_employees():
         # Process employees using the cached categories
         processed_employees = []
         for emp in employees:
+            # Determine availability based on work permit and employee type
+            work_permit_exp = emp.get('work_permit_expiration_date')
+            employee_type = emp.get('employee_type', '')
+            active_status = emp.get('active', True)
+            
+            # Consider available if:
+            # 1. Employee is active
+            # 2. Work permit is not expired (if it exists)
+            # 3. Employee type is not 'freelancer' or 'contractor' (adjust as needed)
+            is_available = active_status
+            if work_permit_exp:
+                from datetime import datetime
+                try:
+                    exp_date = datetime.strptime(work_permit_exp.split(' ')[0], '%Y-%m-%d')
+                    is_available = is_available and exp_date > datetime.now()
+                except:
+                    pass  # If date parsing fails, keep current availability status
+            
             employee_data = {
                 'name': emp.get('name', ''),
                 'job_title': emp.get('job_title', ''),
                 'email': emp.get('work_email', ''),
-                'tags': []
+                'tags': [],
+                'active': active_status,
+                'available': is_available
             }
             
             # Get tags from cached categories
@@ -2703,7 +2822,7 @@ def get_creative_employees():
                 employee_data['tags'] = tags
                 
                 if tags:
-                    print(f"Employee {emp.get('name')} has tags: {tags}")
+                    print(f"Employee {emp.get('name')} has tags: {tags}, active: {active_status}, available: {is_available}")
             
             processed_employees.append(employee_data)
         
@@ -3039,7 +3158,6 @@ def _compute_simple_team_utilization(period=None, view_type='monthly'):
     except Exception as _e:
         print(f"Error in simple utilization fallback: {_e}")
         return {}
-
 def get_creative_timesheet_data(period=None, view_type='monthly'):
     """
     Fetch timesheet data for creative employees for a specific period.
@@ -3633,7 +3751,10 @@ def get_creative_strategy_employees():
                                             'name', 
                                             'job_title', 
                                             'work_email',
-                                            'category_ids'  # This is the many2many field for categories/tags
+                                            'category_ids',  # This is the many2many field for categories/tags
+                                            'active',  # Employee active status
+                                            'work_permit_expiration_date',  # Could indicate availability
+                                            'employee_type'  # Could indicate availability status
                                         ]
                                     })
         
@@ -3670,11 +3791,31 @@ def get_creative_strategy_employees():
         # Process employees using the cached categories
         processed_employees = []
         for emp in employees:
+            # Determine availability based on work permit and employee type
+            work_permit_exp = emp.get('work_permit_expiration_date')
+            employee_type = emp.get('employee_type', '')
+            active_status = emp.get('active', True)
+            
+            # Consider available if:
+            # 1. Employee is active
+            # 2. Work permit is not expired (if it exists)
+            # 3. Employee type is not 'freelancer' or 'contractor' (adjust as needed)
+            is_available = active_status
+            if work_permit_exp:
+                from datetime import datetime
+                try:
+                    exp_date = datetime.strptime(work_permit_exp.split(' ')[0], '%Y-%m-%d')
+                    is_available = is_available and exp_date > datetime.now()
+                except:
+                    pass  # If date parsing fails, keep current availability status
+            
             employee_data = {
                 'name': emp.get('name', ''),
                 'job_title': emp.get('job_title', ''),
                 'email': emp.get('work_email', ''),
-                'tags': []
+                'tags': [],
+                'active': active_status,
+                'available': is_available
             }
             
             # Get tags from cached categories
@@ -3683,7 +3824,7 @@ def get_creative_strategy_employees():
                 employee_data['tags'] = tags
                 
                 if tags:
-                    print(f"Creative Strategy employee {emp.get('name')} has tags: {tags}")
+                    print(f"Creative Strategy employee {emp.get('name')} has tags: {tags}, active: {active_status}, available: {is_available}")
             
             processed_employees.append(employee_data)
         
@@ -3692,7 +3833,6 @@ def get_creative_strategy_employees():
     except Exception as e:
         print(f"Error fetching Creative Strategy employees: {e}")
         return []
-
 def get_creative_strategy_team_utilization_data(period=None, view_type='monthly'):
     """
     Fetch team utilization data for Creative Strategy department teams (KSA, UAE, and Nightshift).
@@ -4461,7 +4601,6 @@ def get_available_creative_strategy_resources(view_type='monthly', period=None):
     except Exception as e:
         print(f"Error fetching Creative Strategy available resources: {e}")
         return []
-
 def get_instructional_design_employees():
     """Fetch employees from Instructional Design department"""
     try:
@@ -4526,7 +4665,10 @@ def get_instructional_design_employees():
                                             'name', 
                                             'job_title', 
                                             'work_email',
-                                            'category_ids'  # This is the many2many field for categories/tags
+                                            'category_ids',  # This is the many2many field for categories/tags
+                                            'active',  # Employee active status
+                                            'work_permit_expiration_date',  # Could indicate availability
+                                            'employee_type'  # Could indicate availability status
                                         ]
                                     })
         
@@ -4563,11 +4705,31 @@ def get_instructional_design_employees():
         # Process employees using the cached categories
         processed_employees = []
         for emp in employees:
+            # Determine availability based on work permit and employee type
+            work_permit_exp = emp.get('work_permit_expiration_date')
+            employee_type = emp.get('employee_type', '')
+            active_status = emp.get('active', True)
+            
+            # Consider available if:
+            # 1. Employee is active
+            # 2. Work permit is not expired (if it exists)
+            # 3. Employee type is not 'freelancer' or 'contractor' (adjust as needed)
+            is_available = active_status
+            if work_permit_exp:
+                from datetime import datetime
+                try:
+                    exp_date = datetime.strptime(work_permit_exp.split(' ')[0], '%Y-%m-%d')
+                    is_available = is_available and exp_date > datetime.now()
+                except:
+                    pass  # If date parsing fails, keep current availability status
+            
             employee_data = {
                 'name': emp.get('name', ''),
                 'job_title': emp.get('job_title', ''),
                 'email': emp.get('work_email', ''),
-                'tags': []
+                'tags': [],
+                'active': active_status,
+                'available': is_available
             }
             
             # Get tags from cached categories
@@ -4576,7 +4738,7 @@ def get_instructional_design_employees():
                 employee_data['tags'] = tags
                 
                 if tags:
-                    print(f"Instructional Design employee {emp.get('name')} has tags: {tags}")
+                    print(f"Instructional Design employee {emp.get('name')} has tags: {tags}, active: {active_status}, available: {is_available}")
             
             processed_employees.append(employee_data)
         
@@ -5258,7 +5420,6 @@ def creative_employees():
         'employees': employees,
         'count': len(employees)
     })
-
 @app.route('/api/team-utilization-data', methods=['GET'])
 def team_utilization_data():
     """API endpoint to get team utilization data"""
@@ -5759,6 +5920,24 @@ def available_creative_strategy_resources():
         'end_date': actual_end.isoformat()
     })
 
+@app.route('/api/sales-order-hours', methods=['GET'])
+def api_sales_order_hours():
+    """Return sales order based hours (Client Dashboard) for the selected period/view."""
+    try:
+        view_type = request.args.get('view_type', 'monthly')
+        period = request.args.get('period')
+        data = get_sales_order_hours_data(period, view_type)
+        if data is None:
+            return jsonify({'success': False, 'error': 'Failed to compute sales order hours'}), 500
+        return jsonify({
+            'success': True,
+            'data': data,
+            'view_type': view_type,
+            'selected_period': period
+        })
+    except Exception as e:
+        print(f"Error in /api/sales-order-hours: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
 @app.route('/api/all-departments-data', methods=['GET'])
 def all_departments_data():
     """
@@ -6302,11 +6481,11 @@ def debug_departments():
         
     except Exception as e:
         return jsonify({'error': f'Error fetching departments: {str(e)}'}), 500
-
 def get_sales_order_hours_data(period=None, view_type='monthly'):
     """
     Fetch and calculate external hours from sales orders for a selected period
-    (monthly by default), filtered by sale order date (date_order).
+    (monthly by default), filtered by sale order date (date_order) and status (state='sale').
+    Only includes sales orders with 'Sales Order' status.
     For Jan-Jun 2025, uses Google Sheets data instead of Odoo.
     """
     try:
@@ -6408,32 +6587,32 @@ def get_sales_order_hours_data(period=None, view_type='monthly'):
             # Try different date formats for Odoo compatibility
             print("Attempting search with date filter...")
             try:
-                # Preferred: filter by month range using datetime strings
+                # Preferred: filter by month range using datetime strings and status = 'sale'
                 sales_order_ids = execute_odoo_call_with_retry(
                     models, uid, 'sale.order', 'search', 
-                    [[('date_order', '>=', start_str), ('date_order', '<=', end_str)]]
+                    [[('date_order', '>=', start_str), ('date_order', '<=', end_str), ('state', '=', 'sale')]]
                 )
-                print(f"Found {len(sales_order_ids)} sales orders with {start_str} <= date_order <= {end_str}")
+                print(f"Found {len(sales_order_ids)} sales orders (state='sale') with {start_str} <= date_order <= {end_str}")
             except Exception as date_error:
                 print(f"Simple date format failed: {date_error}")
                 # Try with datetime format
                 try:
                     sales_order_ids = execute_odoo_call_with_retry(
                         models, uid, 'sale.order', 'search', 
-                        [[('date_order', '>=', start_str)]]
+                        [[('date_order', '>=', start_str), ('state', '=', 'sale')]]
                     )
-                    print(f"Found {len(sales_order_ids)} sales orders with date_order >= {start_str}")
+                    print(f"Found {len(sales_order_ids)} sales orders (state='sale') with date_order >= {start_str}")
                 except Exception as datetime_error:
                     print(f"Datetime format also failed: {datetime_error}")
                     print("Attempting fallback: fetch all orders and filter manually...")
                     
-                    # Fallback: get all orders and filter manually
+                    # Fallback: get all orders with state = 'sale' and filter manually
                     try:
                         all_order_ids = execute_odoo_call_with_retry(
                             models, uid, 'sale.order', 'search', 
-                            [[]]
+                            [[('state', '=', 'sale')]]
                         )
-                        print(f"Retrieved {len(all_order_ids)} total orders for manual filtering")
+                        print(f"Retrieved {len(all_order_ids)} sales orders (state='sale') for manual filtering")
                         
                         # Read all orders with date_order field
                         all_orders = execute_odoo_call_with_retry(
@@ -6480,8 +6659,13 @@ def get_sales_order_hours_data(period=None, view_type='monthly'):
             if not sales_order_ids:
                 print("No sales orders found matching the date criteria")
                 return {
-                    'ksa': {'totalHours': 0, 'orders': []},
-                    'uae': {'totalHours': 0, 'orders': []}
+                    'ksa': {'totalHours': 0, 'totalAmount': 0, 'totalAmountAED': 0, 'currencies': {}, 'orders': []},
+                    'uae': {'totalHours': 0, 'totalAmount': 0, 'totalAmountAED': 0, 'currencies': {}, 'orders': []},
+                    'top_clients': {
+                        'by_hours': [],
+                        'by_revenue': [],
+                        'by_orders': []
+                    }
                 }
             
         except Exception as e:
@@ -6494,13 +6678,75 @@ def get_sales_order_hours_data(period=None, view_type='monthly'):
         try:
             sales_orders = execute_odoo_call_with_retry(
                 models, uid, 'sale.order', 'read',
-                [sales_order_ids, ['name', 'date_order', 'project_id', 'partner_id']]
+                [sales_order_ids, ['name', 'date_order', 'project_id', 'partner_id', 'partner_invoice_id', 'amount_total', 'pricelist_id']]
             )
         except Exception as e:
             print(f"Error reading sales orders: {e}")
             return {'error': f'Failed to read sales orders: {str(e)}'}
         
-        # Step 3: Get project IDs to fetch market information
+        # Step 3: Get pricelist IDs to fetch currency information
+        pricelist_ids = []
+        for order in sales_orders:
+            pricelist_id = order.get('pricelist_id')
+            if pricelist_id:
+                if isinstance(pricelist_id, list) and len(pricelist_id) > 0:
+                    pricelist_ids.append(pricelist_id[0])
+                elif isinstance(pricelist_id, int):
+                    pricelist_ids.append(pricelist_id)
+        
+        # Remove duplicates
+        pricelist_ids = list(set(pricelist_ids))
+        
+        # Step 4: Fetch pricelist data with currency information
+        pricelist_currencies = {}
+        if pricelist_ids:
+            try:
+                pricelists = execute_odoo_call_with_retry(
+                    models, uid, 'product.pricelist', 'read',
+                    [pricelist_ids, ['currency_id']]
+                )
+                
+                for pricelist in pricelists:
+                    pricelist_id = pricelist['id']
+                    currency_data = pricelist.get('currency_id')
+                    if currency_data and isinstance(currency_data, list) and len(currency_data) >= 2:
+                        pricelist_currencies[pricelist_id] = {
+                            'currency_id': currency_data[0],
+                            'currency_name': currency_data[1]
+                        }
+                
+                # Get unique currency IDs to fetch symbols
+                currency_ids = list(set([curr['currency_id'] for curr in pricelist_currencies.values()]))
+                
+                if currency_ids:
+                    currencies = execute_odoo_call_with_retry(
+                        models, uid, 'res.currency', 'read',
+                        [currency_ids, ['name', 'symbol']]
+                    )
+                    
+                    # Map currency symbols
+                    currency_symbols = {}
+                    for currency in currencies:
+                        currency_symbols[currency['id']] = {
+                            'name': currency.get('name', 'USD'),
+                            'symbol': currency.get('symbol', '$')
+                        }
+                    
+                    # Update pricelist_currencies with symbols
+                    for pricelist_id, curr_info in pricelist_currencies.items():
+                        currency_id = curr_info['currency_id']
+                        if currency_id in currency_symbols:
+                            curr_info.update(currency_symbols[currency_id])
+                        else:
+                            curr_info.update({'name': 'USD', 'symbol': '$'})
+                            
+            except Exception as e:
+                print(f"Error reading pricelist/currency data: {e}")
+                # Set default currency for all
+                for pricelist_id in pricelist_ids:
+                    pricelist_currencies[pricelist_id] = {'name': 'USD', 'symbol': '$'}
+        
+        # Step 5: Get project IDs to fetch market information
         project_ids = []
         order_project_map = {}
         
@@ -6557,11 +6803,15 @@ def get_sales_order_hours_data(period=None, view_type='monthly'):
                 order_hours_map[order_id] = 0
             order_hours_map[order_id] += line.get('product_uom_qty', 0)
         
-        # Step 7: Categorize by market (KSA/UAE) and aggregate by customer
+        # Step 7: Categorize by market (KSA/UAE) and aggregate by invoice address
         ksa_customers = {}
         uae_customers = {}
         ksa_total_hours = 0
         uae_total_hours = 0
+        ksa_total_amount = 0
+        uae_total_amount = 0
+        ksa_currencies = {}  # Track KSA pool currencies
+        uae_currencies = {}  # Track UAE pool currencies
         
         for order in sales_orders:
             order_id = order['id']
@@ -6581,58 +6831,201 @@ def get_sales_order_hours_data(period=None, view_type='monthly'):
                 elif isinstance(partner_id, (int, str)):
                     customer_id = partner_id
             
+            # Get invoice address information
+            partner_invoice_id = order.get('partner_invoice_id')
+            invoice_address_name = 'Unknown Invoice Address'
+            invoice_address_id = None
+            
+            if partner_invoice_id:
+                if isinstance(partner_invoice_id, list) and len(partner_invoice_id) >= 2:
+                    invoice_address_id = partner_invoice_id[0]
+                    invoice_address_name = partner_invoice_id[1]
+                elif isinstance(partner_invoice_id, (int, str)):
+                    invoice_address_id = partner_invoice_id
+                    # If we only have ID, use customer name as fallback
+                    invoice_address_name = f"Invoice Address {partner_invoice_id}"
+            else:
+                # If no invoice address, use customer as fallback
+                invoice_address_name = customer_name
+                invoice_address_id = customer_id
+            
+            # Get order amount and currency
+            order_amount = order.get('amount_total', 0) or 0
+            
+            # Get currency information
+            pricelist_data = order.get('pricelist_id')
+            currency_info = {'name': 'USD', 'symbol': '$'}  # Default
+            
+            if pricelist_data:
+                pricelist_id = pricelist_data[0] if isinstance(pricelist_data, list) else pricelist_data
+                if pricelist_id in pricelist_currencies:
+                    currency_info = pricelist_currencies[pricelist_id]
+            
             order_data = {
                 'order_name': order.get('name', 'Unknown'),
                 'order_date': order.get('date_order', 'Unknown'),
                 'market': market,
-                'total_hours': total_hours
+                'total_hours': total_hours,
+                'amount_total': order_amount,
+                'currency': currency_info
             }
             
             if market and market.upper() == 'KSA':
                 ksa_total_hours += total_hours
+                ksa_total_amount += order_amount
                 
-                # Aggregate by customer for KSA
-                if customer_name not in ksa_customers:
-                    ksa_customers[customer_name] = {
-                        'customer_id': customer_id,
-                        'customer_name': customer_name,
+                # Track pool-level currency
+                currency_name = currency_info.get('name', 'USD')
+                if currency_name not in ksa_currencies:
+                    ksa_currencies[currency_name] = {
+                        'amount': 0,
+                        'symbol': currency_info.get('symbol', '$')
+                    }
+                ksa_currencies[currency_name]['amount'] += order_amount
+                
+                # Aggregate by invoice address for KSA
+                if invoice_address_name not in ksa_customers:
+                    ksa_customers[invoice_address_name] = {
+                        'customer_id': invoice_address_id,
+                        'customer_name': invoice_address_name,
                         'total_hours': 0,
+                        'total_amount': 0,
+                        'currencies': {},  # Track multiple currencies
                         'orders': []
                     }
+
+                ksa_customers[invoice_address_name]['total_hours'] += total_hours
+                ksa_customers[invoice_address_name]['total_amount'] += order_amount
                 
-                ksa_customers[customer_name]['total_hours'] += total_hours
-                ksa_customers[customer_name]['orders'].append(order_data)
+                # Track currency breakdown
+                currency_name = currency_info.get('name', 'USD')
+                if currency_name not in ksa_customers[invoice_address_name]['currencies']:
+                    ksa_customers[invoice_address_name]['currencies'][currency_name] = {
+                        'amount': 0,
+                        'symbol': currency_info.get('symbol', '$')
+                    }
+                ksa_customers[invoice_address_name]['currencies'][currency_name]['amount'] += order_amount
+                
+                ksa_customers[invoice_address_name]['orders'].append(order_data)
                 
             elif market and market.upper() == 'UAE':
                 uae_total_hours += total_hours
+                uae_total_amount += order_amount
                 
-                # Aggregate by customer for UAE
-                if customer_name not in uae_customers:
-                    uae_customers[customer_name] = {
-                        'customer_id': customer_id,
-                        'customer_name': customer_name,
+                # Track pool-level currency
+                currency_name = currency_info.get('name', 'USD')
+                if currency_name not in uae_currencies:
+                    uae_currencies[currency_name] = {
+                        'amount': 0,
+                        'symbol': currency_info.get('symbol', '$')
+                    }
+                uae_currencies[currency_name]['amount'] += order_amount
+                
+                # Aggregate by invoice address for UAE
+                if invoice_address_name not in uae_customers:
+                    uae_customers[invoice_address_name] = {
+                        'customer_id': invoice_address_id,
+                        'customer_name': invoice_address_name,
                         'total_hours': 0,
+                        'total_amount': 0,
+                        'currencies': {},  # Track multiple currencies
                         'orders': []
                     }
+
+                uae_customers[invoice_address_name]['total_hours'] += total_hours
+                uae_customers[invoice_address_name]['total_amount'] += order_amount
                 
-                uae_customers[customer_name]['total_hours'] += total_hours
-                uae_customers[customer_name]['orders'].append(order_data)
+                # Track currency breakdown
+                currency_name = currency_info.get('name', 'USD')
+                if currency_name not in uae_customers[invoice_address_name]['currencies']:
+                    uae_customers[invoice_address_name]['currencies'][currency_name] = {
+                        'amount': 0,
+                        'symbol': currency_info.get('symbol', '$')
+                    }
+                uae_customers[invoice_address_name]['currencies'][currency_name]['amount'] += order_amount
+                
+                uae_customers[invoice_address_name]['orders'].append(order_data)
         
-        # Convert customer dictionaries to lists
+        # Convert invoice address dictionaries to lists
         ksa_orders = list(ksa_customers.values())
         uae_orders = list(uae_customers.values())
         
-        print(f"KSA: {len(ksa_orders)} orders, {ksa_total_hours} total hours")
-        print(f"UAE: {len(uae_orders)} orders, {uae_total_hours} total hours")
+        print(f"KSA: {len(ksa_orders)} invoice addresses, {ksa_total_hours} total hours")
+        print(f"UAE: {len(uae_orders)} invoice addresses, {uae_total_hours} total hours")
+        
+        # Debug: Check if we have any customers at all
+        if len(ksa_orders) == 0 and len(uae_orders) == 0:
+            print("WARNING: No customers found in either KSA or UAE orders")
+        else:
+            print(f"DEBUG: KSA sample customer: {ksa_orders[0] if ksa_orders else 'None'}")
+            print(f"DEBUG: UAE sample customer: {uae_orders[0] if uae_orders else 'None'}")
+        
+        # Convert pool totals to AED for scorecard display only
+        ksa_total_aed = 0
+        if ksa_currencies:
+            for currency_name, currency_data in ksa_currencies.items():
+                original_amount = currency_data.get('amount', 0)
+                if original_amount > 0:
+                    aed_amount = convert_to_aed(original_amount, currency_name)
+                    ksa_total_aed += aed_amount
+        
+        uae_total_aed = 0
+        if uae_currencies:
+            for currency_name, currency_data in uae_currencies.items():
+                original_amount = currency_data.get('amount', 0)
+                if original_amount > 0:
+                    aed_amount = convert_to_aed(original_amount, currency_name)
+                    uae_total_aed += aed_amount
+        
+        
+        # Calculate top clients across all categories
+        all_clients = []
+        
+        # Process all customers from both KSA and UAE
+        for customer in ksa_orders + uae_orders:
+            # Calculate total AED amount for this customer
+            customer_aed_total = 0
+            for currency_name, currency_data in customer.get('currencies', {}).items():
+                if currency_data.get('amount', 0) > 0:
+                    aed_amount = convert_to_aed(currency_data['amount'], currency_name)
+                    customer_aed_total += aed_amount
+            
+            # Determine market based on which list the customer is in
+            market = 'KSA' if customer in ksa_orders else 'UAE'
+            
+            client_data = {
+                'customer_name': customer.get('customer_name', 'Unknown Customer'),
+                'total_hours': customer.get('total_hours', 0),
+                'total_revenue_aed': customer_aed_total,
+                'sales_orders_count': len(customer.get('orders', [])),
+                'market': market
+            }
+            all_clients.append(client_data)
+        
+        # Sort and get top 5 in each category
+        top_clients_hours = sorted(all_clients, key=lambda x: x['total_hours'], reverse=True)[:5]
+        top_clients_revenue = sorted(all_clients, key=lambda x: x['total_revenue_aed'], reverse=True)[:5]
+        top_clients_orders = sorted(all_clients, key=lambda x: x['sales_orders_count'], reverse=True)[:5]
         
         return {
             'ksa': {
                 'totalHours': ksa_total_hours,
+                'totalAmount': ksa_total_amount,
+                'totalAmountAED': ksa_total_aed,  # For scorecard display only
+                'currencies': ksa_currencies,
                 'orders': ksa_orders
             },
             'uae': {
                 'totalHours': uae_total_hours,
+                'totalAmount': uae_total_amount,
+                'totalAmountAED': uae_total_aed,  # For scorecard display only
+                'currencies': uae_currencies,
                 'orders': uae_orders
+            },
+            'top_clients': {
+                'by_hours': top_clients_hours,
+                'by_revenue': top_clients_revenue,
+                'by_orders': top_clients_orders
             },
             'view_type': view_type,
             'selected_period': period,
@@ -7072,61 +7465,44 @@ def debug_subscription_states():
             
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+@app.route('/api/sales-order-hours', methods=['GET'])
+def sales_order_hours_endpoint():
+    """Return sales order based hours (Client Dashboard) for the selected period/view."""
+    try:
+        view_type = request.args.get('view_type', 'monthly')
+        period = request.args.get('period')
+        data = get_sales_order_hours_data(period, view_type)
+        if data is None:
+            return jsonify({'success': False, 'error': 'Failed to compute sales order hours'}), 500
+        return jsonify({
+            'success': True,
+            'data': data,
+            'view_type': view_type,
+            'selected_period': period
+        })
+    except Exception as e:
+        print(f"Error in /api/sales-order-hours: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/external-hours', methods=['GET'])
-def external_hours():
-    """
-    API endpoint to get sold hours data for KSA and UAE pools for a selected month.
-    Uses sales order hours data for accurate Efficiency Ratio calculations.
-    """
+def external_hours_endpoint():
+    """Return external hours from sales orders (same as Client Dashboard) for the utilization dashboard."""
     try:
         view_type = request.args.get('view_type', 'monthly')
         period = request.args.get('period')
-        external_hours_data = get_sales_order_hours_data(period, view_type)
-        
-        if 'error' in external_hours_data:
-            return jsonify({'error': external_hours_data['error']}), 500
-        
+        data = get_sales_order_hours_data(period, view_type)
+        if data is None or 'error' in data:
+            error_msg = data.get('error', 'Failed to compute external hours') if data else 'Failed to compute external hours'
+            return jsonify({'success': False, 'error': error_msg}), 500
         return jsonify({
             'success': True,
-            'data': external_hours_data,
-            'timestamp': datetime.datetime.now().isoformat(),
-            'view_type': external_hours_data.get('view_type', view_type),
-            'selected_period': external_hours_data.get('selected_period', period),
-            'start_date': external_hours_data.get('period_start'),
-            'end_date': external_hours_data.get('period_end')
+            'data': data,
+            'view_type': view_type,
+            'selected_period': period
         })
-        
     except Exception as e:
-        print(f"Error in external hours endpoint: {e}")
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/sales-order-hours', methods=['GET'])
-def sales_order_hours():
-    """
-    API endpoint to get external hours from sales orders after July 1st
-    """
-    try:
-        view_type = request.args.get('view_type', 'monthly')
-        period = request.args.get('period')
-        external_hours_data = get_sales_order_hours_data(period, view_type)
-        
-        if 'error' in external_hours_data:
-            return jsonify({'error': external_hours_data['error']}), 500
-        
-        return jsonify({
-            'success': True,
-            'data': external_hours_data,
-            'timestamp': datetime.datetime.now().isoformat(),
-            'view_type': external_hours_data.get('view_type', view_type),
-            'selected_period': external_hours_data.get('selected_period', period),
-            'start_date': external_hours_data.get('period_start'),
-            'end_date': external_hours_data.get('period_end')
-        })
-        
-    except Exception as e:
-        print(f"Error in external hours endpoint: {e}")
-        return jsonify({'error': str(e)}), 500
+        print(f"Error in /api/external-hours: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 if __name__ == '__main__':
     app.run(debug=False, host='0.0.0.0', port=5000) 
