@@ -1,8 +1,39 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import Login from './components/Login';
 import axios from 'axios';
 import './App.css';
 
 function App() {
+  const [isAuthenticated, setIsAuthenticated] = useState(() => {
+    try {
+      return localStorage.getItem('auth_token') === 'ok';
+    } catch (e) { return false; }
+  });
+  const [authError, setAuthError] = useState('');
+
+  const handleLogin = useCallback((username, password) => {
+    if (username === 'admin' && password === 'Prezlab@12345') {
+      try { localStorage.setItem('auth_token', 'ok'); } catch (e) {}
+      setAuthError('');
+      setIsAuthenticated(true);
+    } else {
+      setAuthError('Invalid username or password.');
+      setIsAuthenticated(false);
+    }
+  }, []);
+
+  const handleLogout = useCallback(() => {
+    try { localStorage.removeItem('auth_token'); } catch (e) {}
+    setIsAuthenticated(false);
+  }, []);
+
+  if (!isAuthenticated) {
+    return (
+      <div className="app">
+        <Login onLogin={handleLogin} error={authError} />
+      </div>
+    );
+  }
   const [selectedDepartment, setSelectedDepartment] = useState('Creative');
   const [selectedPeriod, setSelectedPeriod] = useState(() => {
     const now = new Date();
@@ -1043,6 +1074,7 @@ function App() {
         <header className="header">
           <h1>🎨 {selectedDepartment} Department</h1>
           <p>{selectedDepartment} Department Dashboard</p>
+          <button className="logout-btn" onClick={handleLogout} title="Sign out">Logout</button>
           
           {/* Department Switch Buttons */}
           <div className="department-switch">
